@@ -1,0 +1,766 @@
+<Query Kind="Program">
+  <Connection>
+    <ID>49598a36-613b-4feb-9d96-3edf2a6c4920</ID>
+    <NamingServiceVersion>2</NamingServiceVersion>
+    <Persist>true</Persist>
+    <Server>localhost\sqlexpress</Server>
+    <AllowDateOnlyTimeOnly>true</AllowDateOnlyTimeOnly>
+    <Database>BlazorBlogDb</Database>
+    <DriverData>
+      <LegacyMFA>false</LegacyMFA>
+    </DriverData>
+  </Connection>
+  <NuGetReference>Microsoft.Data.SqlClient</NuGetReference>
+</Query>
+
+#nullable enable
+
+#nullable enable
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
+
+using SqlConnection = Microsoft.Data.SqlClient.SqlConnection;
+using SqlCommand = Microsoft.Data.SqlClient.SqlCommand;
+
+
+// ─────────────────────────────────────────────
+//  MAIN
+// ─────────────────────────────────────────────
+void Main()
+{
+	// LINQPad connection string
+	var connectionString = this.Connection.ConnectionString;
+
+	// Output folder
+	var outputRoot = @"C:\dev\SqlCrudProcs";
+	Directory.CreateDirectory(outputRoot);
+
+	// ──────────────────────────────── CONFIG (defaults = usp_ + table schema) ────────────────────────────────
+	var options = new ProcGenOptions
+	{
+		UseUspPrefix = true,                 // default: usp_Table_Insert
+		PluralizeProcNames = false,          // default: no pluralization
+		ProcSchemaOverride = null,           // null/empty => use table schema
+		InsertReturnMode = InsertReturnMode.ScopeIdentity // default: SCOPE_IDENTITY
+	};
+
+	// Filters (optional)
+	string[] includeSchemaPatterns = Array.Empty<string>();
+	string[] excludeSchemaPatterns = Array.Empty<string>();
+	string[] includeTablePatterns = Array.Empty<string>();
+	string[] excludeTablePatterns = { "__EFMigrationsHistory" };
+
+	using var cx = new SqlConnection(connectionString);
+	cx.Open();
+
+	var tables = LoadTables(cx)
+		.Where(t =>
+			MatchesPatterns(t.Schema, includeSchemaPatterns, defaultWhenEmpty: true) &&
+			!MatchesPatterns(t.Schema, excludeSchemaPatterns, defaultWhenEmpty: false) &&
+			MatchesPatterns(t.Name, includeTablePatterns, defaultWhenEmpty: true) &&
+			!MatchesPatterns(t.Name, excludeTablePatterns, defaultWhenEmpty: false))
+		.OrderBy(t => t.Schema).ThenBy(t => t.Name)
+		.ToList();
+
+	if (tables.Count == 0)
+	{
+		"No tables matched filters.".Dump();
+		return;
+	}
+
+	var all = new StringBuilder();
+	all.AppendLine("-- Auto-generated CRUD + UPSERT stored procedures");
+	all.AppendLine("-- Generated: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+	all.AppendLine();
+
+	int generated = 0, skipped = 0;
+
+	foreach (var t in tables)
+	{
+		var columns = LoadColumns(cx, t.Schema, t.Name);
+		var pk = LoadPrimaryKey(cx, t.Schema, t.Name);
+
+		if (pk.Count == 0)
+		{
+			skipped++;
+			all.AppendLine($"-- SKIP: [{t.Schema}].[{t.Name}] (no primary key)");
+			all.AppendLine();
+			continue;
+		}
+
+		var script = GenerateCrudForTable(options, t.Schema, t.Name, columns, pk);
+
+		var fileName = $"{t.Schema}.{t.Name}.CrudProcs.sql";
+		File.WriteAllText(Path.Combine(outputRoot, fileName), script, Encoding.UTF8);
+
+		all.AppendLine(script);
+		all.AppendLine();
+		all.AppendLine("GO");
+		all.AppendLine();
+
+		generated++;
+	}
+
+	File.WriteAllText(Path.Combine(outputRoot, "AllProcs.sql"), all.ToString(), Encoding.UTF8);
+
+	$"Done. Generated: {generated}, Skipped (no PK): {skipped}\r\nOutput: {outputRoot}".Dump();
+}
+
+// ─────────────────────────────────────────────
+//  OPTIONS
+// ─────────────────────────────────────────────
+sealed class ProcGenOptions
+{
+	public bool UseUspPrefix { get; init; } = true;
+	public string? ProcSchemaOverride { get; init; } = null; // null/empty => table schema
+	public bool PluralizeProcNames { get; init; } = false;
+	public InsertReturnMode InsertReturnMode { get; init; } = InsertReturnMode.ScopeIdentity;
+}
+
+enum InsertReturnMode
+{
+	ScopeIdentity,      // default (returns row via SCOPE_IDENTITY when PK is single identity)
+	OutputInserted      // OUTPUT INSERTED.[Id] (instead of SCOPE_IDENTITY)
+}
+
+// ─────────────────────────────────────────────
+//  SCHEMA MODELS
+// ─────────────────────────────────────────────
+sealed record TableInfo(string Schema, string Name);
+
+sealed record ColumnInfo(
+	string Name,
+	string SqlType,
+	int? MaxLength,
+	byte Precision,
+	int Scale,
+	bool IsNullable,
+	bool IsIdentity,
+	bool IsComputed,
+	bool IsRowVersion,
+	bool IsGeneratedAlways,
+	string? CollationName
+);
+
+// ─────────────────────────────────────────────
+//  METADATA QUERIES
+// ─────────────────────────────────────────────
+static List<TableInfo> LoadTables(SqlConnection cx)
+{
+	const string sql = @"
+SELECT s.name AS [Schema], t.name AS [Table]
+FROM sys.tables t
+JOIN sys.schemas s ON s.schema_id = t.schema_id
+WHERE t.is_ms_shipped = 0
+ORDER BY s.name, t.name;";
+
+	using var cmd = new SqlCommand(sql, cx);
+	using var rdr = cmd.ExecuteReader();
+
+	var list = new List<TableInfo>();
+	while (rdr.Read())
+		list.Add(new TableInfo(rdr.GetString(0), rdr.GetString(1)));
+
+	return list;
+}
+
+static List<ColumnInfo> LoadColumns(SqlConnection cx, string schema, string table)
+{
+	const string sql = @"
+SELECT
+    c.name AS ColumnName,
+    ty.name AS TypeName,
+    c.max_length,
+    c.precision,
+    c.scale,
+    c.is_nullable,
+    c.is_identity,
+    c.is_computed,
+    c.generated_always_type,
+    c.collation_name
+FROM sys.tables t
+JOIN sys.schemas s ON s.schema_id = t.schema_id
+JOIN sys.columns c ON c.object_id = t.object_id
+JOIN sys.types ty ON ty.user_type_id = c.user_type_id
+WHERE s.name = @schema AND t.name = @table
+ORDER BY c.column_id;";
+
+	using var cmd = new SqlCommand(sql, cx);
+	cmd.Parameters.AddWithValue("@schema", schema);
+	cmd.Parameters.AddWithValue("@table", table);
+
+	using var rdr = cmd.ExecuteReader();
+
+	var list = new List<ColumnInfo>();
+	while (rdr.Read())
+	{
+		var colName = rdr.GetString(0);
+		var typeName = rdr.GetString(1);
+		var maxLen = rdr.IsDBNull(2) ? (int?)null : rdr.GetInt16(2);
+		var precision = rdr.IsDBNull(3) ? (byte)0 : rdr.GetByte(3);
+		var scale = rdr.IsDBNull(4) ? 0 : rdr.GetByte(4);
+		var isNullable = rdr.GetBoolean(5);
+		var isIdentity = rdr.GetBoolean(6);
+		var isComputed = rdr.GetBoolean(7);
+		var generatedAlwaysType = rdr.IsDBNull(8) ? (byte)0 : rdr.GetByte(8);
+		var collation = rdr.IsDBNull(9) ? null : rdr.GetString(9);
+
+		// metadata returns "timestamp" for rowversion
+		var isRowVersion = typeName.Equals("timestamp", StringComparison.OrdinalIgnoreCase);
+
+		list.Add(new ColumnInfo(
+			Name: colName,
+			SqlType: typeName,
+			MaxLength: maxLen,
+			Precision: precision,
+			Scale: scale,
+			IsNullable: isNullable,
+			IsIdentity: isIdentity,
+			IsComputed: isComputed,
+			IsRowVersion: isRowVersion,
+			IsGeneratedAlways: generatedAlwaysType != 0,
+			CollationName: collation
+		));
+	}
+
+	return list;
+}
+
+static List<string> LoadPrimaryKey(SqlConnection cx, string schema, string table)
+{
+	const string sql = @"
+SELECT c.name
+FROM sys.tables t
+JOIN sys.schemas s ON s.schema_id = t.schema_id
+JOIN sys.key_constraints kc ON kc.parent_object_id = t.object_id AND kc.[type] = 'PK'
+JOIN sys.index_columns ic ON ic.object_id = t.object_id AND ic.index_id = kc.unique_index_id
+JOIN sys.columns c ON c.object_id = t.object_id AND c.column_id = ic.column_id
+WHERE s.name = @schema AND t.name = @table
+ORDER BY ic.key_ordinal;";
+
+	using var cmd = new SqlCommand(sql, cx);
+	cmd.Parameters.AddWithValue("@schema", schema);
+	cmd.Parameters.AddWithValue("@table", table);
+
+	using var rdr = cmd.ExecuteReader();
+	var pk = new List<string>();
+	while (rdr.Read())
+		pk.Add(rdr.GetString(0));
+
+	return pk;
+}
+
+// ─────────────────────────────────────────────
+//  GENERATION
+// ─────────────────────────────────────────────
+static string GenerateCrudForTable(
+	ProcGenOptions options,
+	string tableSchema,
+	string tableName,
+	List<ColumnInfo> cols,
+	List<string> pkCols)
+{
+	var fullTable = $"[{tableSchema}].[{tableName}]";
+
+	var procSchema = string.IsNullOrWhiteSpace(options.ProcSchemaOverride)
+		? tableSchema
+		: options.ProcSchemaOverride!.Trim();
+
+	var procTableName = options.PluralizeProcNames ? SimplePluralize(tableName) : tableName;
+	var procPrefix = options.UseUspPrefix ? "usp_" : "";
+	var procBase = $"{procPrefix}{procTableName}";
+
+	var identityCol = cols.FirstOrDefault(c => c.IsIdentity);
+	var rowVersionCol = cols.FirstOrDefault(c => c.IsRowVersion);
+
+	var insertCols = cols.Where(c => !c.IsIdentity && !c.IsComputed && !c.IsRowVersion && !c.IsGeneratedAlways).ToList();
+	var updateCols = cols.Where(c =>
+		!pkCols.Contains(c.Name, StringComparer.OrdinalIgnoreCase) &&
+		!c.IsIdentity &&
+		!c.IsComputed &&
+		!c.IsRowVersion &&
+		!c.IsGeneratedAlways).ToList();
+
+	var pkParams = pkCols.Select(pk => cols.First(c => c.Name.Equals(pk, StringComparison.OrdinalIgnoreCase))).ToList();
+
+	var sb = new StringBuilder();
+	sb.AppendLine($"-- =====================================================");
+	sb.AppendLine($"-- CRUD + UPSERT Procs for {fullTable}");
+	sb.AppendLine($"-- =====================================================");
+	sb.AppendLine();
+
+	sb.AppendLine(GenInsertProc(options, procSchema, procBase, fullTable, insertCols, pkCols, identityCol));
+	sb.AppendLine("GO");
+	sb.AppendLine();
+	sb.AppendLine(GenUpdateProc(procSchema, procBase, fullTable, pkParams, updateCols, rowVersionCol));
+	sb.AppendLine("GO");
+	sb.AppendLine();
+	sb.AppendLine(GenDeleteProc(procSchema, procBase, fullTable, pkParams, rowVersionCol));
+	sb.AppendLine("GO");
+	sb.AppendLine();
+	sb.AppendLine(GenUpsertProc(options, procSchema, procBase, fullTable, cols, pkParams, insertCols, updateCols, identityCol, rowVersionCol));
+	sb.AppendLine("GO");
+	sb.AppendLine();
+	sb.AppendLine(GenGetByIdProc(procSchema, procBase, fullTable, pkParams));
+	sb.AppendLine("GO");
+	sb.AppendLine();
+	sb.AppendLine(GenListPagedProc(procSchema, procBase, fullTable, cols, pkParams));
+	sb.AppendLine();
+
+	return sb.ToString();
+}
+
+static string GenInsertProc(
+	ProcGenOptions options,
+	string procSchema,
+	string procBase,
+	string fullTable,
+	List<ColumnInfo> insertCols,
+	List<string> pkCols,
+	ColumnInfo? identityCol)
+{
+	var proc = $"[{procSchema}].[{procBase}_Insert]";
+
+	var parameters = insertCols.Select(ParamDecl).ToList();
+
+	bool returnIdentity =
+		identityCol != null &&
+		(pkCols.Count == 1 && pkCols[0].Equals(identityCol.Name, StringComparison.OrdinalIgnoreCase));
+
+	if (returnIdentity && options.InsertReturnMode == InsertReturnMode.ScopeIdentity)
+		parameters.Add($"@NewId {SqlTypeDecl(identityCol!)} OUTPUT");
+
+	var insertList = string.Join(", ", insertCols.Select(c => $"[{c.Name}]"));
+	var valuesList = string.Join(", ", insertCols.Select(c => $"@{c.Name}"));
+
+	var sb = new StringBuilder();
+	sb.AppendLine($"CREATE OR ALTER PROCEDURE {proc}");
+	if (parameters.Count > 0)
+		sb.AppendLine("    " + string.Join(",\r\n    ", parameters));
+	sb.AppendLine("AS");
+	sb.AppendLine("BEGIN");
+	sb.AppendLine("    SET NOCOUNT ON;");
+	sb.AppendLine("    SET XACT_ABORT ON;");
+	sb.AppendLine();
+	sb.AppendLine("    BEGIN TRY");
+	sb.AppendLine("        BEGIN TRAN;");
+	sb.AppendLine();
+
+	if (insertCols.Count == 0)
+	{
+		sb.AppendLine($"        INSERT INTO {fullTable} DEFAULT VALUES;");
+	}
+	else
+	{
+		if (returnIdentity && options.InsertReturnMode == InsertReturnMode.OutputInserted)
+		{
+			sb.AppendLine($"        INSERT INTO {fullTable} ({insertList})");
+			sb.AppendLine($"        OUTPUT INSERTED.[{identityCol!.Name}] AS [NewId]");
+			sb.AppendLine($"        VALUES ({valuesList});");
+		}
+		else
+		{
+			sb.AppendLine($"        INSERT INTO {fullTable} ({insertList})");
+			sb.AppendLine($"        VALUES ({valuesList});");
+		}
+	}
+
+	if (returnIdentity && options.InsertReturnMode == InsertReturnMode.ScopeIdentity)
+	{
+		sb.AppendLine();
+		sb.AppendLine("        SET @NewId = CONVERT(" + identityCol!.SqlType + ", SCOPE_IDENTITY());");
+		sb.AppendLine();
+		sb.AppendLine($"        SELECT * FROM {fullTable} WHERE [{identityCol!.Name}] = @NewId;");
+	}
+
+	sb.AppendLine();
+	sb.AppendLine("        COMMIT;");
+	sb.AppendLine("    END TRY");
+	sb.AppendLine("    BEGIN CATCH");
+	sb.AppendLine("        IF @@TRANCOUNT > 0 ROLLBACK;");
+	sb.AppendLine("        THROW;");
+	sb.AppendLine("    END CATCH");
+	sb.AppendLine("END");
+
+	return sb.ToString();
+}
+
+static string GenUpdateProc(
+	string procSchema,
+	string procBase,
+	string fullTable,
+	List<ColumnInfo> pkParams,
+	List<ColumnInfo> updateCols,
+	ColumnInfo? rowVersionCol)
+{
+	var proc = $"[{procSchema}].[{procBase}_Update]";
+
+	var parameters = new List<string>();
+	parameters.AddRange(pkParams.Select(ParamDecl));
+	if (rowVersionCol != null) parameters.Add($"@RowVersion {SqlTypeDecl(rowVersionCol)}");
+	parameters.AddRange(updateCols.Select(ParamDecl));
+
+	var wherePk = string.Join(" AND ", pkParams.Select(c => $"t.[{c.Name}] = @{c.Name}"));
+	var setList = updateCols.Count == 0 ? "" : string.Join(",\r\n            ", updateCols.Select(c => $"[{c.Name}] = @{c.Name}"));
+
+	var sb = new StringBuilder();
+	sb.AppendLine($"CREATE OR ALTER PROCEDURE {proc}");
+	sb.AppendLine("    " + string.Join(",\r\n    ", parameters));
+	sb.AppendLine("AS");
+	sb.AppendLine("BEGIN");
+	sb.AppendLine("    SET NOCOUNT ON;");
+	sb.AppendLine("    SET XACT_ABORT ON;");
+	sb.AppendLine();
+	sb.AppendLine("    BEGIN TRY");
+	sb.AppendLine("        BEGIN TRAN;");
+	sb.AppendLine();
+
+	if (updateCols.Count == 0)
+	{
+		sb.AppendLine($"        IF NOT EXISTS (SELECT 1 FROM {fullTable} t WHERE {wherePk})");
+		sb.AppendLine("            THROW 50001, 'Row not found.', 1;");
+	}
+	else
+	{
+		sb.AppendLine($"        UPDATE t");
+		sb.AppendLine("        SET");
+		sb.AppendLine("            " + setList);
+		sb.AppendLine($"        FROM {fullTable} t");
+		sb.Append("        WHERE ").Append(wherePk);
+
+		if (rowVersionCol != null)
+			sb.Append($" AND t.[{rowVersionCol.Name}] = @RowVersion");
+
+		sb.AppendLine(";");
+		sb.AppendLine();
+		sb.AppendLine("        IF @@ROWCOUNT = 0");
+		sb.AppendLine("            THROW 50002, 'Update failed (not found and/or concurrency conflict).', 1;");
+	}
+
+	sb.AppendLine();
+	sb.AppendLine("        COMMIT;");
+	sb.AppendLine("    END TRY");
+	sb.AppendLine("    BEGIN CATCH");
+	sb.AppendLine("        IF @@TRANCOUNT > 0 ROLLBACK;");
+	sb.AppendLine("        THROW;");
+	sb.AppendLine("    END CATCH");
+	sb.AppendLine("END");
+
+	return sb.ToString();
+}
+
+static string GenDeleteProc(
+	string procSchema,
+	string procBase,
+	string fullTable,
+	List<ColumnInfo> pkParams,
+	ColumnInfo? rowVersionCol)
+{
+	var proc = $"[{procSchema}].[{procBase}_Delete]";
+
+	var parameters = new List<string>();
+	parameters.AddRange(pkParams.Select(ParamDecl));
+	if (rowVersionCol != null) parameters.Add($"@RowVersion {SqlTypeDecl(rowVersionCol)}");
+
+	var wherePk = string.Join(" AND ", pkParams.Select(c => $"t.[{c.Name}] = @{c.Name}"));
+
+	var sb = new StringBuilder();
+	sb.AppendLine($"CREATE OR ALTER PROCEDURE {proc}");
+	sb.AppendLine("    " + string.Join(",\r\n    ", parameters));
+	sb.AppendLine("AS");
+	sb.AppendLine("BEGIN");
+	sb.AppendLine("    SET NOCOUNT ON;");
+	sb.AppendLine("    SET XACT_ABORT ON;");
+	sb.AppendLine();
+	sb.AppendLine("    BEGIN TRY");
+	sb.AppendLine("        BEGIN TRAN;");
+	sb.AppendLine();
+
+	sb.AppendLine($"        DELETE t FROM {fullTable} t");
+	sb.Append("        WHERE ").Append(wherePk);
+
+	if (rowVersionCol != null)
+		sb.Append($" AND t.[{rowVersionCol.Name}] = @RowVersion");
+
+	sb.AppendLine(";");
+	sb.AppendLine();
+	sb.AppendLine("        IF @@ROWCOUNT = 0");
+	sb.AppendLine("            THROW 50003, 'Delete failed (not found and/or concurrency conflict).', 1;");
+
+	sb.AppendLine();
+	sb.AppendLine("        COMMIT;");
+	sb.AppendLine("    END TRY");
+	sb.AppendLine("    BEGIN CATCH");
+	sb.AppendLine("        IF @@TRANCOUNT > 0 ROLLBACK;");
+	sb.AppendLine("        THROW;");
+	sb.AppendLine("    END CATCH");
+	sb.AppendLine("END");
+
+	return sb.ToString();
+}
+
+static string GenUpsertProc(
+	ProcGenOptions options,
+	string procSchema,
+	string procBase,
+	string fullTable,
+	List<ColumnInfo> allCols,
+	List<ColumnInfo> pkParams,
+	List<ColumnInfo> insertCols,
+	List<ColumnInfo> updateCols,
+	ColumnInfo? identityCol,
+	ColumnInfo? rowVersionCol)
+{
+	var proc = $"[{procSchema}].[{procBase}_Upsert]";
+
+	bool singleIdentityPk =
+		identityCol != null &&
+		pkParams.Count == 1 &&
+		pkParams[0].Name.Equals(identityCol.Name, StringComparison.OrdinalIgnoreCase);
+
+	// Params
+	var parameters = new List<string>();
+
+	if (singleIdentityPk)
+	{
+		// caller can pass NULL to force insert
+		parameters.Add($"@{identityCol!.Name} {SqlTypeDecl(identityCol)} = NULL");
+	}
+	else
+	{
+		parameters.AddRange(pkParams.Select(ParamDecl));
+	}
+
+	// Optional rowversion for update/delete/upsert concurrency
+	if (rowVersionCol != null)
+		parameters.Add($"@RowVersion {SqlTypeDecl(rowVersionCol)} = NULL");
+
+	// Data params (union of insertable + updatable, de-duped)
+	var dataCols = insertCols
+		.Concat(updateCols)
+		.GroupBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
+		.Select(g => g.First())
+		.ToList();
+
+	parameters.AddRange(dataCols.Select(ParamDecl));
+
+	// WHERE PK
+	string wherePk = singleIdentityPk
+		? $"t.[{identityCol!.Name}] = @{identityCol!.Name}"
+		: string.Join(" AND ", pkParams.Select(c => $"t.[{c.Name}] = @{c.Name}"));
+
+	// Concurrency predicate (only if caller provides @RowVersion)
+	string concurrencyPredicate = rowVersionCol != null
+		? $" AND (@RowVersion IS NULL OR t.[{rowVersionCol.Name}] = @RowVersion)"
+		: "";
+
+	// UPDATE SET
+	var setList = updateCols.Count == 0
+		? ""
+		: string.Join(",\r\n            ", updateCols.Select(c => $"[{c.Name}] = @{c.Name}"));
+
+	// INSERT lists
+	var insertList = insertCols.Count == 0 ? "" : string.Join(", ", insertCols.Select(c => $"[{c.Name}]"));
+	var valuesList = insertCols.Count == 0 ? "" : string.Join(", ", insertCols.Select(c => $"@{c.Name}"));
+
+	var sb = new StringBuilder();
+	sb.AppendLine($"CREATE OR ALTER PROCEDURE {proc}");
+	sb.AppendLine("    " + string.Join(",\r\n    ", parameters));
+	sb.AppendLine("AS");
+	sb.AppendLine("BEGIN");
+	sb.AppendLine("    SET NOCOUNT ON;");
+	sb.AppendLine("    SET XACT_ABORT ON;");
+	sb.AppendLine();
+	sb.AppendLine("    BEGIN TRY");
+	sb.AppendLine("        BEGIN TRAN;");
+	sb.AppendLine();
+
+	if (singleIdentityPk)
+	{
+		sb.AppendLine($"        IF @{identityCol!.Name} IS NULL");
+		sb.AppendLine("        BEGIN");
+
+		if (insertCols.Count == 0)
+		{
+			sb.AppendLine($"            INSERT INTO {fullTable} DEFAULT VALUES;");
+		}
+		else
+		{
+			sb.AppendLine($"            INSERT INTO {fullTable} ({insertList})");
+			sb.AppendLine($"            VALUES ({valuesList});");
+		}
+
+		sb.AppendLine();
+		sb.AppendLine($"            DECLARE @NewId {SqlTypeDecl(identityCol)} = CONVERT({identityCol.SqlType}, SCOPE_IDENTITY());");
+		sb.AppendLine($"            SELECT * FROM {fullTable} WHERE [{identityCol.Name}] = @NewId;");
+		sb.AppendLine("        END");
+		sb.AppendLine("        ELSE");
+		sb.AppendLine("        BEGIN");
+	}
+
+	// UPDATE first, then INSERT if nothing updated (non-identity PK only)
+	if (updateCols.Count > 0)
+	{
+		sb.AppendLine($"            UPDATE t");
+		sb.AppendLine("            SET");
+		sb.AppendLine("                " + setList);
+		sb.AppendLine($"            FROM {fullTable} t");
+		sb.AppendLine($"            WHERE {wherePk}{concurrencyPredicate};");
+		sb.AppendLine();
+		sb.AppendLine("            IF @@ROWCOUNT = 0");
+		sb.AppendLine("            BEGIN");
+
+		if (singleIdentityPk)
+		{
+			sb.AppendLine("                THROW 50010, 'Upsert update failed (not found and/or concurrency conflict).', 1;");
+		}
+		else
+		{
+			if (insertCols.Count == 0)
+			{
+				sb.AppendLine($"                INSERT INTO {fullTable} DEFAULT VALUES;");
+			}
+			else
+			{
+				sb.AppendLine($"                INSERT INTO {fullTable} ({insertList})");
+				sb.AppendLine($"                VALUES ({valuesList});");
+			}
+		}
+
+		sb.AppendLine("            END");
+	}
+	else
+	{
+		sb.AppendLine($"            IF EXISTS (SELECT 1 FROM {fullTable} t WHERE {wherePk}{concurrencyPredicate})");
+		sb.AppendLine($"                SELECT * FROM {fullTable} t WHERE {wherePk};");
+		sb.AppendLine("            ELSE");
+		sb.AppendLine("            BEGIN");
+
+		if (singleIdentityPk)
+			sb.AppendLine("                THROW 50011, 'Upsert failed: no updatable columns and identity key supplied was not found.', 1;");
+		else if (insertCols.Count == 0)
+			sb.AppendLine($"                INSERT INTO {fullTable} DEFAULT VALUES;");
+		else
+		{
+			sb.AppendLine($"                INSERT INTO {fullTable} ({insertList})");
+			sb.AppendLine($"                VALUES ({valuesList});");
+		}
+
+		sb.AppendLine("            END");
+	}
+
+	sb.AppendLine();
+	sb.AppendLine("            -- Return the current row");
+	sb.AppendLine($"            SELECT * FROM {fullTable} t WHERE {wherePk};");
+
+	if (singleIdentityPk)
+		sb.AppendLine("        END");
+
+	sb.AppendLine();
+	sb.AppendLine("        COMMIT;");
+	sb.AppendLine("    END TRY");
+	sb.AppendLine("    BEGIN CATCH");
+	sb.AppendLine("        IF @@TRANCOUNT > 0 ROLLBACK;");
+	sb.AppendLine("        THROW;");
+	sb.AppendLine("    END CATCH");
+	sb.AppendLine("END");
+
+	return sb.ToString();
+}
+
+static string GenGetByIdProc(string procSchema, string procBase, string fullTable, List<ColumnInfo> pkParams)
+{
+	var proc = $"[{procSchema}].[{procBase}_GetById]";
+	var wherePk = string.Join(" AND ", pkParams.Select(c => $"t.[{c.Name}] = @{c.Name}"));
+
+	var sb = new StringBuilder();
+	sb.AppendLine($"CREATE OR ALTER PROCEDURE {proc}");
+	sb.AppendLine("    " + string.Join(",\r\n    ", pkParams.Select(ParamDecl)));
+	sb.AppendLine("AS");
+	sb.AppendLine("BEGIN");
+	sb.AppendLine("    SET NOCOUNT ON;");
+	sb.AppendLine();
+	sb.AppendLine($"    SELECT * FROM {fullTable} t WHERE {wherePk};");
+	sb.AppendLine("END");
+	return sb.ToString();
+}
+
+static string GenListPagedProc(string procSchema, string procBase, string fullTable, List<ColumnInfo> cols, List<ColumnInfo> pkParams)
+{
+	var proc = $"[{procSchema}].[{procBase}_ListPaged]";
+
+	var orderCols = pkParams.Count > 0
+		? pkParams.Select(c => $"t.[{c.Name}]").ToList()
+		: new List<string> { $"t.[{cols.First().Name}]" };
+
+	var sb = new StringBuilder();
+	sb.AppendLine($"CREATE OR ALTER PROCEDURE {proc}");
+	sb.AppendLine("    @Skip int = 0,");
+	sb.AppendLine("    @Take int = 100");
+	sb.AppendLine("AS");
+	sb.AppendLine("BEGIN");
+	sb.AppendLine("    SET NOCOUNT ON;");
+	sb.AppendLine();
+	sb.AppendLine("    IF @Skip < 0 SET @Skip = 0;");
+	sb.AppendLine("    IF @Take IS NULL OR @Take <= 0 SET @Take = 100;");
+	sb.AppendLine();
+	sb.AppendLine($"    SELECT * FROM {fullTable} t");
+	sb.AppendLine($"    ORDER BY {string.Join(", ", orderCols)}");
+	sb.AppendLine("    OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY;");
+	sb.AppendLine("END");
+	return sb.ToString();
+}
+
+// ─────────────────────────────────────────────
+//  SQL TYPE / PARAM HELPERS
+// ─────────────────────────────────────────────
+static string ParamDecl(ColumnInfo c)
+{
+	var type = SqlTypeDecl(c);
+	var nullable = c.IsNullable ? " = NULL" : "";
+	return $"@{c.Name} {type}{nullable}";
+}
+
+static string SqlTypeDecl(ColumnInfo c)
+{
+	var t = c.SqlType.ToLowerInvariant();
+
+	if (t is "varchar" or "char" or "varbinary" or "binary")
+		return $"{t}({Len(c.MaxLength)})";
+
+	if (t is "nvarchar" or "nchar")
+		return $"{t}({NLen(c.MaxLength)})";
+
+	if (t is "decimal" or "numeric")
+		return $"{t}({c.Precision},{c.Scale})";
+
+	if (t is "datetime2" or "datetimeoffset" or "time")
+		return $"{t}({c.Scale})";
+
+	return t;
+}
+
+static string Len(int? maxLength) => (maxLength is null || maxLength == -1) ? "MAX" : maxLength.Value.ToString();
+
+static string NLen(int? maxLength)
+{
+	if (maxLength is null || maxLength == -1) return "MAX";
+	return (maxLength.Value / 2).ToString();
+}
+
+// ─────────────────────────────────────────────
+//  FILTER + PLURALIZE
+// ─────────────────────────────────────────────
+static bool MatchesPatterns(string value, string[] patterns, bool defaultWhenEmpty)
+{
+	if (patterns.Length == 0) return defaultWhenEmpty;
+	return patterns.Any(p => value.Contains(p, StringComparison.OrdinalIgnoreCase));
+}
+
+static string SimplePluralize(string s) =>
+	s.EndsWith("y", StringComparison.OrdinalIgnoreCase) ? s[..^1] + "ies" :
+	s.EndsWith("s", StringComparison.OrdinalIgnoreCase) ? s + "es" : s + "s";
