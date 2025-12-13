@@ -1,13 +1,16 @@
 <Query Kind="Program">
   <Connection>
-    <ID>49598a36-613b-4feb-9d96-3edf2a6c4920</ID>
-    <NamingServiceVersion>2</NamingServiceVersion>
+    <ID>87b6df13-2c94-4d97-bd8d-077b419ecd46</ID>
+    <NamingServiceVersion>3</NamingServiceVersion>
     <Persist>true</Persist>
-    <Server>localhost\sqlexpress</Server>
+    <Server>localhost</Server>
     <AllowDateOnlyTimeOnly>true</AllowDateOnlyTimeOnly>
-    <Database>BlazorBlogDb</Database>
+    <UseMicrosoftDataSqlClient>true</UseMicrosoftDataSqlClient>
+    <EncryptTraffic>true</EncryptTraffic>
+    <Database>NW</Database>
+    <MapXmlToString>false</MapXmlToString>
     <DriverData>
-      <LegacyMFA>false</LegacyMFA>
+      <SkipCertificateCheck>true</SkipCertificateCheck>
     </DriverData>
   </Connection>
   <NuGetReference>Microsoft.Data.SqlClient</NuGetReference>
@@ -21,12 +24,12 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using Microsoft.Data.SqlClient;
+using System.IO;
 
 // ─────────────────────────────────────────────
-// LINQPad 9: FINAL Universal Stored Procedure Generator
-// 100% COMPILABLE – Fixed empty SET clause & all previous issues
+// LINQPad 9: Universal Stored Procedure Generator
+// With optional per-table file output (enabled by default)
 // ─────────────────────────────────────────────
-
 void Main()
 {
 	var options = new GeneratorOptions
@@ -38,7 +41,9 @@ void Main()
 		IncludeListAll = true,
 		IncludeSearch = true,
 		EnableAuditTrail = true,
-		ExcludedTablePatterns = new[] { "__EFMigrationsHistory" }
+		ExcludedTablePatterns = new[] { "__EFMigrationsHistory" },
+		OutputRootFolder = @"C:\dev\SqlCrudProcs",  // Change or set to null/empty to disable file saving
+		SavePerTableFiles = true                   // Set to false to disable per-table file output
 	};
 
 	using var conn = new SqlConnection(this.Connection.ConnectionString);
@@ -80,18 +85,48 @@ void Main()
 
 		var script = GenerateProcedures(options, table.Schema, table.Name, columns, pkNames);
 
+		// Always output to LINQPad console/results
 		script.Dump($"Procedures for [{table.Schema}].[{table.Name}]");
 
 		master.AppendLine(script);
 		master.AppendLine("GO");
 		master.AppendLine();
 
+		// Optional: Save each table's procedures to its own file
+		if (options.SavePerTableFiles && !string.IsNullOrWhiteSpace(options.OutputRootFolder))
+		{
+			try
+			{
+				Directory.CreateDirectory(options.OutputRootFolder);
+
+				var safeSchema = table.Schema.Replace(".", "_");
+				var safeTable = table.Name.Replace(".", "_");
+				var fileName = $"{safeSchema}_{safeTable}_CRUD.sql";
+				var fullPath = Path.Combine(options.OutputRootFolder, fileName);
+
+				var fileContent = new StringBuilder();
+				fileContent.AppendLine($"-- CRUD Procedures for [{table.Schema}].[{table.Name}]");
+				fileContent.AppendLine($"-- Database: {conn.Database}");
+				fileContent.AppendLine($"-- Generated: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+				fileContent.AppendLine("-- =================================================");
+				fileContent.AppendLine();
+				fileContent.AppendLine(script);
+				fileContent.AppendLine("GO");
+
+				File.WriteAllText(fullPath, fileContent.ToString());
+				$"Saved: {fullPath}".Dump();
+			}
+			catch (Exception ex)
+			{
+				$"ERROR saving file for [{table.Schema}].[{table.Name}]: {ex.Message}".Dump();
+			}
+		}
+
 		generated++;
 	}
 
-	master.ToString().Dump("=== ALL GENERATED PROCEDURES ===");
-
-	$"Generated clean, compilable procedures for {generated} tables. All output above.".Dump();
+	master.ToString().Dump("=== ALL GENERATED PROCEDURES (MASTER SCRIPT) ===");
+	$"Generated clean, compilable procedures for {generated} tables.".Dump();
 }
 
 // ─────────────────────────────────────────────
@@ -107,6 +142,8 @@ sealed class GeneratorOptions
 	public bool IncludeSearch { get; init; } = true;
 	public bool EnableAuditTrail { get; init; } = true;
 	public string[] ExcludedTablePatterns { get; init; } = Array.Empty<string>();
+	public string? OutputRootFolder { get; init; } = @"C:\dev\SqlCrudProcs";
+	public bool SavePerTableFiles { get; init; } = true;
 }
 
 // ─────────────────────────────────────────────
@@ -138,7 +175,6 @@ static List<Column> LoadColumns(SqlConnection conn, string schema, string table)
         JOIN sys.schemas s ON s.schema_id = t.schema_id
         WHERE s.name = @schema AND t.name = @table
         ORDER BY c.column_id";
-
 	using var cmd = new SqlCommand(sql, conn);
 	cmd.Parameters.AddWithValue("@schema", schema);
 	cmd.Parameters.AddWithValue("@table", table);
@@ -172,7 +208,6 @@ static List<string> LoadPrimaryKey(SqlConnection conn, string schema, string tab
           AND s.name = @schema
           AND t.name = @table
         ORDER BY ic.key_ordinal";
-
 	using var cmd = new SqlCommand(sql, conn);
 	cmd.Parameters.AddWithValue("@schema", schema);
 	cmd.Parameters.AddWithValue("@table", table);
@@ -190,11 +225,9 @@ static (Column? Created, Column? Updated) DetectAuditColumns(List<Column> column
 	var created = columns.FirstOrDefault(c =>
 		c.Name.Contains("Created", StringComparison.OrdinalIgnoreCase) &&
 		c.TypeName.Contains("date", StringComparison.OrdinalIgnoreCase));
-
 	var updated = columns.FirstOrDefault(c =>
 		c.Name.Contains("Updated", StringComparison.OrdinalIgnoreCase) &&
 		c.TypeName.Contains("date", StringComparison.OrdinalIgnoreCase));
-
 	return (created, updated);
 }
 
@@ -206,14 +239,12 @@ static string GenerateProcedures(GeneratorOptions opts, string tableSchema, stri
 	var table = $"[{tableSchema}].[{tableName}]";
 	var procSchema = opts.ProcSchemaOverride ?? tableSchema;
 	var baseName = $"{(opts.UseUspPrefix ? "usp_" : "")}{tableName}";
-
 	var pkColumns = pkNames.Select(n => columns.First(c => c.Name == n)).ToList();
 	var identity = columns.FirstOrDefault(c => c.IsIdentity);
 	var isIdentityPk = identity != null && pkNames.Count == 1 && pkNames[0] == identity.Name;
 
 	var insertable = columns.Where(c => !c.IsIdentity && !c.IsComputed).ToList();
 
-	// Updatable: exclude PK and audit columns
 	var updatable = columns.Where(c =>
 		!pkNames.Contains(c.Name) &&
 		!c.IsIdentity &&
@@ -247,10 +278,8 @@ static string GenerateProcedures(GeneratorOptions opts, string tableSchema, stri
 	AddProc($"{baseName}_Upsert", () => sb.Append(UpsertProc(procSchema, baseName, table, insertable, updatable, pkColumns, identity, createdCol, updatedCol)));
 	AddProc($"{baseName}_Delete", () => sb.Append(DeleteProc(procSchema, baseName, table, pkColumns)));
 	AddProc($"{baseName}_GetById", () => sb.Append(GetByIdProc(procSchema, baseName, table, pkColumns)));
-
 	if (opts.IncludeListAll)
 		AddProc($"{baseName}_ListAll", () => sb.Append(ListAllProc(procSchema, baseName, table)));
-
 	if (opts.IncludeSearch && columns.Any(c => c.TypeName.Contains("char", StringComparison.OrdinalIgnoreCase)))
 		AddProc($"{baseName}_Search", () => sb.Append(SearchProc(procSchema, baseName, table, columns)));
 
@@ -258,7 +287,7 @@ static string GenerateProcedures(GeneratorOptions opts, string tableSchema, stri
 }
 
 // ─────────────────────────────────────────────
-// Insert – safe audit
+// Insert
 // ─────────────────────────────────────────────
 static string InsertProc(string schema, string baseName, string table, List<Column> cols, List<Column> pk, Column? identity, Column? created)
 {
@@ -278,62 +307,60 @@ static string InsertProc(string schema, string baseName, string table, List<Colu
 
 	var sb = new StringBuilder();
 	sb.AppendLine($"CREATE OR ALTER PROCEDURE {proc}");
-	if (parms.Any()) sb.AppendLine("    " + string.Join(",\r\n    ", parms));
+	if (parms.Any()) sb.AppendLine(" " + string.Join(",\r\n ", parms));
 	sb.AppendLine("AS BEGIN");
-	sb.AppendLine("    SET NOCOUNT ON;");
-	sb.AppendLine($"    INSERT INTO {table} ({string.Join(", ", fields)})");
-	sb.AppendLine($"    VALUES ({string.Join(", ", values)});");
+	sb.AppendLine(" SET NOCOUNT ON;");
+	sb.AppendLine($" INSERT INTO {table} ({string.Join(", ", fields)})");
+	sb.AppendLine($" VALUES ({string.Join(", ", values)});");
 
 	if (identity != null && pk.Count == 1 && pk[0].Name == identity.Name)
 	{
-		sb.AppendLine($"    SET @NewId = SCOPE_IDENTITY();");
-		sb.AppendLine("    SELECT @NewId AS NewId;");
+		sb.AppendLine($" SET @NewId = SCOPE_IDENTITY();");
+		sb.AppendLine(" SELECT @NewId AS NewId;");
 	}
 	sb.AppendLine("END");
 	return sb.ToString();
 }
 
 // ─────────────────────────────────────────────
-// Update – skip if no updatable columns
+// Update
 // ─────────────────────────────────────────────
 static string UpdateProc(string schema, string baseName, string table, List<Column> pk, List<Column> cols, Column? updated)
 {
 	var proc = $"[{schema}].[{baseName}_Update]";
 	var parms = pk.Select(ParamDecl).Concat(cols.Select(ParamDecl)).ToList();
-
-	var sets = new List<string>(cols.Select(c => $"            [{c.Name}] = @{c.Name}"));
+	var sets = new List<string>(cols.Select(c => $" [{c.Name}] = @{c.Name}"));
 	if (updated != null && !cols.Any(c => c.Name == updated.Name))
-		sets.Add($"            [{updated.Name}] = SYSUTCDATETIME()");
+		sets.Add($" [{updated.Name}] = SYSUTCDATETIME()");
 
 	var where = string.Join(" AND ", pk.Select(c => $"t.[{c.Name}] = @{c.Name}"));
 
 	var sb = new StringBuilder();
 	sb.AppendLine($"CREATE OR ALTER PROCEDURE {proc}");
-	sb.AppendLine("    " + string.Join(",\r\n    ", parms));
+	sb.AppendLine(" " + string.Join(",\r\n ", parms));
 	sb.AppendLine("AS BEGIN");
-	sb.AppendLine("    SET NOCOUNT ON;");
+	sb.AppendLine(" SET NOCOUNT ON;");
 
 	if (sets.Any())
 	{
-		sb.AppendLine("    UPDATE t SET");
-		sb.AppendLine("        " + string.Join(",\r\n        ", sets));
-		sb.AppendLine($"    FROM {table} t");
-		sb.AppendLine($"    WHERE {where};");
+		sb.AppendLine(" UPDATE t SET");
+		sb.AppendLine(" " + string.Join(",\r\n ", sets));
+		sb.AppendLine($" FROM {table} t");
+		sb.AppendLine($" WHERE {where};");
 	}
 	else
 	{
-		// No updatable columns – just check existence
-		sb.AppendLine($"    IF NOT EXISTS (SELECT 1 FROM {table} t WHERE {where})");
-		sb.AppendLine("        RAISERROR('Record not found', 16, 1);");
+		sb.AppendLine($" IF NOT EXISTS (SELECT 1 FROM {table} t WHERE {where})");
+		sb.AppendLine(" RAISERROR('Record not found', 16, 1);");
 	}
 
-	sb.AppendLine("    SELECT @@ROWCOUNT AS RowsAffected;");
+	sb.AppendLine(" SELECT @@ROWCOUNT AS RowsAffected;");
 	sb.AppendLine("END");
 	return sb.ToString();
 }
 
 // ─────────────────────────────────────────────
-// Upsert – skip update if no updatable columns
+// Upsert
 // ─────────────────────────────────────────────
 static string UpsertProc(string schema, string baseName, string table, List<Column> insert, List<Column> update, List<Column> pk, Column? identity, Column? created, Column? updated)
 {
@@ -342,7 +369,7 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 
 	var parms = new List<string>();
 	if (isIdentityPk)
-		parms.Add($"@{identity.Name} {SqlType(identity)} = NULL");
+		parms.Add($"@{identity!.Name} {SqlType(identity)} = NULL");
 	else
 		parms.AddRange(pk.Select(ParamDecl));
 
@@ -353,49 +380,53 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 
 	parms.AddRange(data.Select(ParamDecl));
 
-	var where = isIdentityPk ? $"t.[{identity.Name}] = @{identity.Name}" : string.Join(" AND ", pk.Select(p => $"t.[{p.Name}] = @{p.Name}"));
+	var where = isIdentityPk ? $"t.[{identity!.Name}] = @{identity.Name}" : string.Join(" AND ", pk.Select(p => $"t.[{p.Name}] = @{p.Name}"));
 
 	var sb = new StringBuilder();
 	sb.AppendLine($"CREATE OR ALTER PROCEDURE {proc}");
-	sb.AppendLine("    " + string.Join(",\r\n    ", parms));
+	sb.AppendLine(" " + string.Join(",\r\n ", parms));
 	sb.AppendLine("AS BEGIN");
-	sb.AppendLine("    SET NOCOUNT ON;");
+	sb.AppendLine(" SET NOCOUNT ON;");
 
-	var updateSets = new List<string>(update.Select(c => $"            [{c.Name}] = @{c.Name}"));
+	var updateSets = new List<string>(update.Select(c => $" [{c.Name}] = @{c.Name}"));
 	if (updated != null && !update.Any(c => c.Name == updated.Name))
-		updateSets.Add($"            [{updated.Name}] = SYSUTCDATETIME()");
+		updateSets.Add($" [{updated.Name}] = SYSUTCDATETIME()");
 
 	if (updateSets.Any())
 	{
-		sb.AppendLine("    UPDATE t SET");
-		sb.AppendLine("        " + string.Join(",\r\n        ", updateSets));
-		sb.AppendLine($"    FROM {table} t");
-		sb.AppendLine($"    WHERE {where};");
+		sb.AppendLine(" UPDATE t SET");
+		sb.AppendLine(" " + string.Join(",\r\n ", updateSets));
+		sb.AppendLine($" FROM {table} t");
+		sb.AppendLine($" WHERE {where};");
 		sb.AppendLine();
 	}
 
-	sb.AppendLine("    IF @@ROWCOUNT = 0 BEGIN");
-	var insertFields = new List<string>(insert.Select(c => $"[{c.Name}]"));
-	var insertValues = new List<string>(insert.Select(c => $"@{c.Name}"));
+	sb.AppendLine(" IF @@ROWCOUNT = 0 BEGIN");
+	var insertFields = insert.Select(c => $"[{c.Name}]").ToList();
+	var insertValues = insert.Select(c => $"@{c.Name}").ToList();
+
 	if (created != null && !insert.Any(c => c.Name == created.Name))
 	{
 		insertFields.Add($"[{created.Name}]");
 		insertValues.Add("SYSUTCDATETIME()");
 	}
-	sb.AppendLine($"        INSERT INTO {table} ({string.Join(", ", insertFields)})");
-	sb.AppendLine($"        VALUES ({string.Join(", ", insertValues)});");
-	if (isIdentityPk)
-		sb.AppendLine($"        SET @{identity.Name} = SCOPE_IDENTITY();");
-	sb.AppendLine("    END");
 
-	sb.AppendLine($"    SELECT * FROM {table} t WHERE {where};");
-	sb.AppendLine("    SELECT 1 AS RowsAffected;");
+	sb.AppendLine($" INSERT INTO {table} ({string.Join(", ", insertFields)})");
+	sb.AppendLine($" VALUES ({string.Join(", ", insertValues)});");
+
+	if (isIdentityPk)
+		sb.AppendLine($" SET @{identity!.Name} = SCOPE_IDENTITY();");
+
+	sb.AppendLine(" END");
+
+	sb.AppendLine($" SELECT * FROM {table} t WHERE {where};");
+	sb.AppendLine(" SELECT 1 AS RowsAffected;");
 	sb.AppendLine("END");
 	return sb.ToString();
 }
 
 // ─────────────────────────────────────────────
-// Other Procs (unchanged)
+// Other Procs
 // ─────────────────────────────────────────────
 static string DeleteProc(string schema, string baseName, string table, List<Column> pk)
 {
@@ -405,11 +436,11 @@ static string DeleteProc(string schema, string baseName, string table, List<Colu
 
 	var sb = new StringBuilder();
 	sb.AppendLine($"CREATE OR ALTER PROCEDURE {proc}");
-	sb.AppendLine("    " + string.Join(",\r\n    ", parms));
+	sb.AppendLine(" " + string.Join(",\r\n ", parms));
 	sb.AppendLine("AS BEGIN");
-	sb.AppendLine("    SET NOCOUNT ON;");
-	sb.AppendLine($"    DELETE FROM {table} WHERE {where};");
-	sb.AppendLine("    SELECT @@ROWCOUNT AS RowsAffected;");
+	sb.AppendLine(" SET NOCOUNT ON;");
+	sb.AppendLine($" DELETE FROM {table} WHERE {where};");
+	sb.AppendLine(" SELECT @@ROWCOUNT AS RowsAffected;");
 	sb.AppendLine("END");
 	return sb.ToString();
 }
@@ -422,10 +453,10 @@ static string GetByIdProc(string schema, string baseName, string table, List<Col
 
 	var sb = new StringBuilder();
 	sb.AppendLine($"CREATE OR ALTER PROCEDURE {proc}");
-	sb.AppendLine("    " + string.Join(",\r\n    ", parms));
+	sb.AppendLine(" " + string.Join(",\r\n ", parms));
 	sb.AppendLine("AS BEGIN");
-	sb.AppendLine("    SET NOCOUNT ON;");
-	sb.AppendLine($"    SELECT * FROM {table} WHERE {where};");
+	sb.AppendLine(" SET NOCOUNT ON;");
+	sb.AppendLine($" SELECT * FROM {table} WHERE {where};");
 	sb.AppendLine("END");
 	return sb.ToString();
 }
@@ -435,8 +466,8 @@ static string ListAllProc(string schema, string baseName, string table)
 	var sb = new StringBuilder();
 	sb.AppendLine($"CREATE OR ALTER PROCEDURE [{schema}].[{baseName}_ListAll]");
 	sb.AppendLine("AS BEGIN");
-	sb.AppendLine("    SET NOCOUNT ON;");
-	sb.AppendLine($"    SELECT * FROM {table};");
+	sb.AppendLine(" SET NOCOUNT ON;");
+	sb.AppendLine($" SELECT * FROM {table};");
 	sb.AppendLine("END");
 	return sb.ToString();
 }
@@ -450,13 +481,13 @@ static string SearchProc(string schema, string baseName, string table, List<Colu
 
 	var sb = new StringBuilder();
 	sb.AppendLine($"CREATE OR ALTER PROCEDURE [{schema}].[{baseName}_Search]");
-	sb.AppendLine("    @Search nvarchar(200) = NULL");
+	sb.AppendLine(" @Search nvarchar(200) = NULL");
 	sb.AppendLine("AS BEGIN");
-	sb.AppendLine("    SET NOCOUNT ON;");
-	sb.AppendLine($"    SELECT * FROM {table}");
-	sb.AppendLine($"    WHERE @Search IS NULL OR ({conditions})");
-	sb.AppendLine("    ORDER BY (SELECT NULL)");
-	sb.AppendLine("    OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;");
+	sb.AppendLine(" SET NOCOUNT ON;");
+	sb.AppendLine($" SELECT * FROM {table}");
+	sb.AppendLine($" WHERE @Search IS NULL OR ({conditions})");
+	sb.AppendLine(" ORDER BY (SELECT NULL)");
+	sb.AppendLine(" OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;");
 	sb.AppendLine("END");
 	return sb.ToString();
 }

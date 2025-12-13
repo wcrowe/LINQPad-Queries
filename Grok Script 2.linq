@@ -213,24 +213,27 @@ static List<ColumnInfo> LoadColumns(SqlConnection cx, string schema, string tabl
 	return list;
 }
 
-static List<string> LoadPrimaryKey(SqlConnection cx, string schema, string table)
+static List<string> LoadPrimaryKey(SqlConnection conn, string schema, string table)
 {
 	const string sql = @"
-        SELECT c.name
-        FROM sys.tables t
-        JOIN sys.schemas s ON s.schema_id = t.schema_id
-        JOIN sys.key_constraints kc ON kc.parent_object_id = t.object_id AND kc.type = 'PK'
-        JOIN sys.index_columns ic ON ic.object_id = t.object_id AND ic.index_id = kc.unique_index_id
-        JOIN sys.columns c ON c.object_id = t.object_id AND c.column_id = ic.column_id
-        WHERE s.name = @schema AND t.name = @table
-        ORDER BY ic.key_ordinal;";
+        SELECT COL_NAME(ic.object_id, ic.column_id)
+        FROM sys.indexes i
+        INNER JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+        INNER JOIN sys.tables t ON i.object_id = t.object_id
+        INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
+        WHERE i.is_primary_key = 1
+          AND s.name = @schema
+          AND t.name = @table
+        ORDER BY ic.key_ordinal";
 
-	using var cmd = new SqlCommand(sql, cx);
+	using var cmd = new SqlCommand(sql, conn);
 	cmd.Parameters.AddWithValue("@schema", schema);
 	cmd.Parameters.AddWithValue("@table", table);
-	using var rdr = cmd.ExecuteReader();
+
+	using var reader = cmd.ExecuteReader();
 	var pk = new List<string>();
-	while (rdr.Read()) pk.Add(rdr.GetString(0));
+	while (reader.Read())
+		pk.Add(reader.GetString(0));
 	return pk;
 }
 
