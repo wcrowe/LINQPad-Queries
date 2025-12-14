@@ -7,7 +7,7 @@
     <AllowDateOnlyTimeOnly>true</AllowDateOnlyTimeOnly>
     <UseMicrosoftDataSqlClient>true</UseMicrosoftDataSqlClient>
     <EncryptTraffic>true</EncryptTraffic>
-    <Database>NW</Database>
+    <Database>BlazorBlogDb</Database>
     <MapXmlToString>false</MapXmlToString>
     <DriverData>
       <SkipCertificateCheck>true</SkipCertificateCheck>
