@@ -400,12 +400,13 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 	var proc = $"[{schema}].[{baseName}_Upsert]";
 	bool isIdentityPk = identity != null && pk.Count == 1 && pk[0].Name == identity.Name;
 
-	// Parameters: all PK columns + all data columns (insertable + updatable)
+	// All unique data columns (insertable + updatable, no PK)
 	var allDataColumns = insertable.Concat(updatable)
 		.GroupBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
 		.Select(g => g.First())
 		.ToList();
 
+	// Parameters: PK (with OUTPUT if identity) + non-PK data columns
 	var parms = new List<string>();
 	foreach (var p in pk)
 	{
@@ -414,7 +415,12 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 		else
 			parms.Add(ParamDecl(p));
 	}
-	parms.AddRange(allDataColumns.Select(ParamDecl));
+
+	var nonPkDataColumns = allDataColumns
+		.Where(c => !pk.Any(p => p.Name.Equals(c.Name, StringComparison.OrdinalIgnoreCase)))
+		.ToList();
+
+	parms.AddRange(nonPkDataColumns.Select(ParamDecl));
 
 	var sb = new StringBuilder();
 	sb.AppendLine($"CREATE OR ALTER PROCEDURE {proc}");
@@ -425,15 +431,8 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 	sb.AppendLine(" BEGIN TRY");
 	sb.AppendLine("  BEGIN TRANSACTION;");
 
-	// Build WHERE clause for PK match
-	var pkWhere = string.Join(" AND ", pk.Select(p => $"t.[{p.Name}] = @{p.Name}"));
-
 	// UPDATE first (only if row exists)
-	var updateSets = allDataColumns
-		.Where(c => !pk.Any(p => p.Name.Equals(c.Name, StringComparison.OrdinalIgnoreCase)))
-		.Select(c => $"[{c.Name}] = @{c.Name}")
-		.ToList();
-
+	var updateSets = nonPkDataColumns.Select(c => $"[{c.Name}] = @{c.Name}").ToList();
 	if (updated != null)
 		updateSets.Add($"[{updated.Name}] = SYSUTCDATETIME()");
 
@@ -442,7 +441,7 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 		sb.AppendLine($"  UPDATE t SET");
 		sb.AppendLine("   " + string.Join(",\r\n   ", updateSets));
 		sb.AppendLine($"  FROM {table} t");
-		sb.AppendLine($"  WHERE {pkWhere};");
+		sb.AppendLine($"  WHERE {string.Join(" AND ", pk.Select(p => $"t.[{p.Name}] = @{p.Name}"))};");
 		sb.AppendLine();
 	}
 
@@ -475,7 +474,7 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 
 	// Return the affected row
 	sb.AppendLine();
-	sb.AppendLine($"  SELECT * FROM {table} t WHERE {pkWhere};");
+	sb.AppendLine($"  SELECT * FROM {table} t WHERE {string.Join(" AND ", pk.Select(p => $"t.[{p.Name}] = @{p.Name}"))};");
 	sb.AppendLine("  SELECT 1 AS RowsAffected;");
 
 	sb.AppendLine(" END TRY");
