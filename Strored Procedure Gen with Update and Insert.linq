@@ -28,8 +28,12 @@ using System.IO;
 
 // ─────────────────────────────────────────────
 // LINQPad 9: Universal Stored Procedure Generator
-// New version: Upsert uses separate UPDATE + INSERT (no MERGE)
-// Better performance, simpler plan, same functionality
+// Features:
+// - Separate UPDATE + INSERT for Upsert (better performance than MERGE)
+// - Full transaction + TRY/CATCH
+// - Audit columns (Created*/Updated*) auto-filled with SYSUTCDATETIME()
+// - Soft delete support (IsDeleted/IsActive bit column)
+// - Clean, safe, production-ready code
 // ─────────────────────────────────────────────
 void Main()
 {
@@ -42,6 +46,7 @@ void Main()
 		IncludeListAll = true,
 		IncludeSearch = true,
 		EnableAuditTrail = true,
+		EnableSoftDelete = true,                 // Set to false if you don't want soft delete
 		ExcludedTablePatterns = new[] { "__EFMigrationsHistory" },
 		OutputRootFolder = @"C:\dev\SqlCrudProcs",
 		SavePerTableFiles = true
@@ -65,6 +70,7 @@ void Main()
 	var master = new StringBuilder();
 	master.AppendLine("-- =================================================");
 	master.AppendLine("-- Auto-Generated CRUD Stored Procedures");
+	master.AppendLine("-- Features: Upsert (UPDATE+INSERT), Audit, Soft Delete");
 	master.AppendLine($"-- Database: {conn.Database}");
 	master.AppendLine($"-- Generated: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
 	master.AppendLine("-- =================================================");
@@ -140,6 +146,7 @@ sealed class GeneratorOptions
 	public bool IncludeListAll { get; init; } = true;
 	public bool IncludeSearch { get; init; } = true;
 	public bool EnableAuditTrail { get; init; } = true;
+	public bool EnableSoftDelete { get; init; } = true;
 	public string[] ExcludedTablePatterns { get; init; } = Array.Empty<string>();
 	public string? OutputRootFolder { get; init; } = @"C:\dev\SqlCrudProcs";
 	public bool SavePerTableFiles { get; init; } = true;
@@ -217,22 +224,27 @@ static List<string> LoadPrimaryKey(SqlConnection conn, string schema, string tab
 }
 
 // ─────────────────────────────────────────────
-// Audit Detection (enhanced)
+// Audit + Soft Delete Detection
 // ─────────────────────────────────────────────
-static (Column? Created, Column? Updated) DetectAuditColumns(List<Column> columns)
+static (Column? Created, Column? Updated, Column? SoftDelete) DetectSpecialColumns(List<Column> columns)
 {
 	var createdPatterns = new[] { "Created", "CreatedOn", "CreatedAt", "DateCreated" };
 	var updatedPatterns = new[] { "Updated", "UpdatedOn", "UpdatedAt", "DateUpdated", "LastModified" };
+	var softDeletePatterns = new[] { "IsDeleted", "Deleted", "IsActive", "Active" };
 
 	var created = columns.FirstOrDefault(c =>
 		createdPatterns.Any(p => c.Name.Contains(p, StringComparison.OrdinalIgnoreCase)) &&
-		(c.TypeName.Contains("date", StringComparison.OrdinalIgnoreCase) || c.TypeName == "datetime2"));
+		c.TypeName.Contains("date", StringComparison.OrdinalIgnoreCase));
 
 	var updated = columns.FirstOrDefault(c =>
 		updatedPatterns.Any(p => c.Name.Contains(p, StringComparison.OrdinalIgnoreCase)) &&
-		(c.TypeName.Contains("date", StringComparison.OrdinalIgnoreCase) || c.TypeName == "datetime2"));
+		c.TypeName.Contains("date", StringComparison.OrdinalIgnoreCase));
 
-	return (created, updated);
+	var softDelete = columns.FirstOrDefault(c =>
+		softDeletePatterns.Any(p => c.Name.Contains(p, StringComparison.OrdinalIgnoreCase)) &&
+		c.TypeName == "bit");
+
+	return (created, updated, softDelete);
 }
 
 // ─────────────────────────────────────────────
@@ -251,26 +263,24 @@ static string GenerateProcedures(GeneratorOptions opts, string tableSchema, stri
 	var insertable = columns.Where(c =>
 		!c.IsIdentity &&
 		!c.IsComputed &&
-		!(opts.EnableAuditTrail &&
-		  (c.Name.Contains("Created", StringComparison.OrdinalIgnoreCase) ||
-		   c.Name.Contains("Updated", StringComparison.OrdinalIgnoreCase)))
-	).ToList();
+		!(opts.EnableAuditTrail && (c.Name.Contains("Created", StringComparison.OrdinalIgnoreCase) || c.Name.Contains("Updated", StringComparison.OrdinalIgnoreCase))) &&
+		!(opts.EnableSoftDelete && (c.Name.Contains("IsDeleted", StringComparison.OrdinalIgnoreCase) || c.Name.Contains("IsActive", StringComparison.OrdinalIgnoreCase))))
+		.ToList();
 
 	var updatable = columns.Where(c =>
 		!pkNames.Contains(c.Name) &&
 		!c.IsIdentity &&
 		!c.IsComputed &&
-		!(opts.EnableAuditTrail &&
-		  (c.Name.Contains("Created", StringComparison.OrdinalIgnoreCase) ||
-		   c.Name.Contains("Updated", StringComparison.OrdinalIgnoreCase)))
-	).ToList();
+		!(opts.EnableAuditTrail && (c.Name.Contains("Created", StringComparison.OrdinalIgnoreCase) || c.Name.Contains("Updated", StringComparison.OrdinalIgnoreCase))) &&
+		!(opts.EnableSoftDelete && (c.Name.Contains("IsDeleted", StringComparison.OrdinalIgnoreCase) || c.Name.Contains("IsActive", StringComparison.OrdinalIgnoreCase))))
+		.ToList();
 
-	var (createdCol, updatedCol) = DetectAuditColumns(columns);
+	var (createdCol, updatedCol, softDeleteCol) = DetectSpecialColumns(columns);
 
 	var sb = new StringBuilder();
 	sb.AppendLine($"-- CRUD Procedures for {table}");
-	if (createdCol != null || updatedCol != null)
-		sb.AppendLine($"-- Audit: {(createdCol != null ? "Created" : "")} {(updatedCol != null ? "Updated" : "")}".Trim());
+	if (createdCol != null || updatedCol != null || softDeleteCol != null)
+		sb.AppendLine($"-- Special: {(createdCol != null ? "Created" : "")} {(updatedCol != null ? "Updated" : "")} {(softDeleteCol != null ? "SoftDelete" : "")}".Trim());
 	sb.AppendLine();
 
 	void AddProc(string name, Action generator)
@@ -284,24 +294,24 @@ static string GenerateProcedures(GeneratorOptions opts, string tableSchema, stri
 		sb.AppendLine();
 	}
 
-	AddProc($"{baseName}_Insert", () => sb.Append(InsertProc(procSchema, baseName, table, insertable, pkColumns, identity, createdCol, updatedCol)));
+	AddProc($"{baseName}_Insert", () => sb.Append(InsertProc(procSchema, baseName, table, insertable, pkColumns, identity, createdCol, updatedCol, softDeleteCol)));
 	if (updatable.Any() || updatedCol != null)
-		AddProc($"{baseName}_Update", () => sb.Append(UpdateProc(procSchema, baseName, table, pkColumns, updatable, updatedCol)));
-	AddProc($"{baseName}_Upsert", () => sb.Append(UpsertProc(procSchema, baseName, table, insertable, updatable, columns, pkColumns, identity, createdCol, updatedCol)));
-	AddProc($"{baseName}_Delete", () => sb.Append(DeleteProc(procSchema, baseName, table, pkColumns)));
-	AddProc($"{baseName}_GetById", () => sb.Append(GetByIdProc(procSchema, baseName, table, pkColumns)));
+		AddProc($"{baseName}_Update", () => sb.Append(UpdateProc(procSchema, baseName, table, pkColumns, updatable, updatedCol, softDeleteCol)));
+	AddProc($"{baseName}_Upsert", () => sb.Append(UpsertProc(procSchema, baseName, table, insertable, updatable, columns, pkColumns, identity, createdCol, updatedCol, softDeleteCol)));
+	AddProc($"{baseName}_Delete", () => sb.Append(DeleteProc(procSchema, baseName, table, pkColumns, softDeleteCol, opts.EnableSoftDelete)));
+	AddProc($"{baseName}_GetById", () => sb.Append(GetByIdProc(procSchema, baseName, table, pkColumns, softDeleteCol, opts.EnableSoftDelete)));
 	if (opts.IncludeListAll)
-		AddProc($"{baseName}_ListAll", () => sb.Append(ListAllProc(procSchema, baseName, table)));
+		AddProc($"{baseName}_ListAll", () => sb.Append(ListAllProc(procSchema, baseName, table, softDeleteCol, opts.EnableSoftDelete)));
 	if (opts.IncludeSearch && columns.Any(c => c.TypeName.Contains("char", StringComparison.OrdinalIgnoreCase)))
-		AddProc($"{baseName}_Search", () => sb.Append(SearchProc(procSchema, baseName, table, columns)));
+		AddProc($"{baseName}_Search", () => sb.Append(SearchProc(procSchema, baseName, table, columns, softDeleteCol, opts.EnableSoftDelete)));
 
 	return sb.ToString();
 }
 
 // ─────────────────────────────────────────────
-// Insert with TRY/CATCH
+// Insert (with audit + soft delete init)
 // ─────────────────────────────────────────────
-static string InsertProc(string schema, string baseName, string table, List<Column> cols, List<Column> pk, Column? identity, Column? created, Column? updated)
+static string InsertProc(string schema, string baseName, string table, List<Column> cols, List<Column> pk, Column? identity, Column? created, Column? updated, Column? softDelete)
 {
 	var proc = $"[{schema}].[{baseName}_Insert]";
 	var fields = cols.Select(c => $"[{c.Name}]").ToList();
@@ -318,6 +328,12 @@ static string InsertProc(string schema, string baseName, string table, List<Colu
 	{
 		fields.Add($"[{updated.Name}]");
 		values.Add("SYSUTCDATETIME()");
+	}
+
+	if (softDelete != null)
+	{
+		fields.Add($"[{softDelete.Name}]");
+		values.Add(softDelete.Name.Contains("IsActive") ? "1" : "0");
 	}
 
 	if (identity != null && pk.Count == 1 && pk[0].Name == identity.Name)
@@ -351,9 +367,9 @@ static string InsertProc(string schema, string baseName, string table, List<Colu
 }
 
 // ─────────────────────────────────────────────
-// Update with TRY/CATCH
+// Update (audit Updated column only)
 // ─────────────────────────────────────────────
-static string UpdateProc(string schema, string baseName, string table, List<Column> pk, List<Column> cols, Column? updated)
+static string UpdateProc(string schema, string baseName, string table, List<Column> pk, List<Column> cols, Column? updated, Column? softDelete)
 {
 	var proc = $"[{schema}].[{baseName}_Update]";
 	var parms = pk.Select(ParamDecl).Concat(cols.Select(ParamDecl)).ToList();
@@ -398,10 +414,9 @@ static string UpdateProc(string schema, string baseName, string table, List<Colu
 }
 
 // ─────────────────────────────────────────────
-// New Upsert: Separate UPDATE then INSERT (better performance)
-// UpsertProc (now with audit columns)
+// Upsert with audit + soft delete
 // ─────────────────────────────────────────────
-static string UpsertProc(string schema, string baseName, string table, List<Column> insertable, List<Column> updatable, List<Column> columns, List<Column> pk, Column? identity, Column? created, Column? updated)
+static string UpsertProc(string schema, string baseName, string table, List<Column> insertable, List<Column> updatable, List<Column> columns, List<Column> pk, Column? identity, Column? created, Column? updated, Column? softDelete)
 {
 	var proc = $"[{schema}].[{baseName}_Upsert]";
 	bool isIdentityPk = identity != null && pk.Count == 1 && pk[0].Name == identity.Name;
@@ -411,7 +426,6 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 		.Select(g => g.First())
 		.ToList();
 
-	// Parameters: PK + non-PK data columns (exclude audit columns)
 	var parms = new List<string>();
 	foreach (var p in pk)
 	{
@@ -423,7 +437,7 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 
 	var nonPkDataColumns = allDataColumns
 		.Where(c => !pk.Any(p => p.Name.Equals(c.Name, StringComparison.OrdinalIgnoreCase)))
-		.Where(c => c != created && c != updated)  // exclude audit columns
+		.Where(c => c != created && c != updated && c != softDelete)
 		.ToList();
 
 	parms.AddRange(nonPkDataColumns.Select(ParamDecl));
@@ -439,7 +453,7 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 
 	var pkWhere = string.Join(" AND ", pk.Select(p => $"t.[{p.Name}] = @{p.Name}"));
 
-	// UPDATE: update data + Updated column
+	// UPDATE
 	var updateSets = nonPkDataColumns.Select(c => $"[{c.Name}] = @{c.Name}").ToList();
 	if (updated != null)
 		updateSets.Add($"[{updated.Name}] = SYSUTCDATETIME()");
@@ -453,16 +467,11 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 		sb.AppendLine();
 	}
 
-	// INSERT if no update occurred
+	// INSERT
 	sb.AppendLine($"  IF @@ROWCOUNT = 0");
 	sb.AppendLine("  BEGIN");
 
-	var insertFields = columns
-		.Where(c => !c.IsIdentity && !c.IsComputed)
-		.Where(c => c != created && c != updated || created == c || updated == c)  // include audit
-		.Select(c => $"[{c.Name}]")
-		.ToList();
-
+	var insertFields = columns.Where(c => !c.IsIdentity && !c.IsComputed).Select(c => $"[{c.Name}]").ToList();
 	var insertValues = insertFields.Select(f =>
 	{
 		var colName = f.Trim('[', ']');
@@ -470,6 +479,8 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 			return "SYSUTCDATETIME()";
 		if (updated != null && colName.Equals(updated.Name, StringComparison.OrdinalIgnoreCase))
 			return "SYSUTCDATETIME()";
+		if (softDelete != null && colName.Equals(softDelete.Name, StringComparison.OrdinalIgnoreCase))
+			return softDelete.Name.Contains("IsActive") ? "1" : "0";
 		return $"@{colName}";
 	}).ToList();
 
@@ -500,9 +511,9 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 }
 
 // ─────────────────────────────────────────────
-// Delete with TRY/CATCH
+// Soft Delete (or hard delete if disabled)
 // ─────────────────────────────────────────────
-static string DeleteProc(string schema, string baseName, string table, List<Column> pk)
+static string DeleteProc(string schema, string baseName, string table, List<Column> pk, Column? softDeleteCol, bool enableSoftDelete)
 {
 	var proc = $"[{schema}].[{baseName}_Delete]";
 	var parms = pk.Select(ParamDecl).ToList();
@@ -515,7 +526,17 @@ static string DeleteProc(string schema, string baseName, string table, List<Colu
 	sb.AppendLine(" SET NOCOUNT ON;");
 	sb.AppendLine();
 	sb.AppendLine(" BEGIN TRY");
-	sb.AppendLine($"  DELETE FROM {table} WHERE {where};");
+
+	if (enableSoftDelete && softDeleteCol != null)
+	{
+		var flagValue = softDeleteCol.Name.Contains("IsActive") ? "0" : "1";
+		sb.AppendLine($"  UPDATE {table} SET [{softDeleteCol.Name}] = {flagValue} WHERE {where};");
+	}
+	else
+	{
+		sb.AppendLine($"  DELETE FROM {table} WHERE {where};");
+	}
+
 	sb.AppendLine("  SELECT @@ROWCOUNT AS RowsAffected;");
 	sb.AppendLine(" END TRY");
 	sb.AppendLine(" BEGIN CATCH");
@@ -529,9 +550,9 @@ static string DeleteProc(string schema, string baseName, string table, List<Colu
 }
 
 // ─────────────────────────────────────────────
-// Read-only procs
+// Read procedures (filter soft-deleted)
 // ─────────────────────────────────────────────
-static string GetByIdProc(string schema, string baseName, string table, List<Column> pk)
+static string GetByIdProc(string schema, string baseName, string table, List<Column> pk, Column? softDeleteCol, bool enableSoftDelete)
 {
 	var proc = $"[{schema}].[{baseName}_GetById]";
 	var parms = pk.Select(ParamDecl).ToList();
@@ -542,23 +563,38 @@ static string GetByIdProc(string schema, string baseName, string table, List<Col
 	sb.AppendLine(" " + string.Join(",\r\n ", parms));
 	sb.AppendLine("AS BEGIN");
 	sb.AppendLine(" SET NOCOUNT ON;");
-	sb.AppendLine($" SELECT * FROM {table} WHERE {where};");
+	sb.AppendLine($" SELECT * FROM {table}");
+	sb.AppendLine($" WHERE {where}");
+
+	if (enableSoftDelete && softDeleteCol != null)
+	{
+		var condition = softDeleteCol.Name.Contains("IsActive") ? "= 1" : "= 0";
+		sb.AppendLine($"   AND [{softDeleteCol.Name}] {condition}");
+	}
+
 	sb.AppendLine("END");
 	return sb.ToString();
 }
 
-static string ListAllProc(string schema, string baseName, string table)
+static string ListAllProc(string schema, string baseName, string table, Column? softDeleteCol, bool enableSoftDelete)
 {
 	var sb = new StringBuilder();
 	sb.AppendLine($"CREATE OR ALTER PROCEDURE [{schema}].[{baseName}_ListAll]");
 	sb.AppendLine("AS BEGIN");
 	sb.AppendLine(" SET NOCOUNT ON;");
-	sb.AppendLine($" SELECT * FROM {table};");
+	sb.AppendLine($" SELECT * FROM {table}");
+
+	if (enableSoftDelete && softDeleteCol != null)
+	{
+		var condition = softDeleteCol.Name.Contains("IsActive") ? "= 1" : "= 0";
+		sb.AppendLine($" WHERE [{softDeleteCol.Name}] {condition}");
+	}
+
 	sb.AppendLine("END");
 	return sb.ToString();
 }
 
-static string SearchProc(string schema, string baseName, string table, List<Column> cols)
+static string SearchProc(string schema, string baseName, string table, List<Column> cols, Column? softDeleteCol, bool enableSoftDelete)
 {
 	var searchable = cols.Where(c => c.TypeName.Contains("char", StringComparison.OrdinalIgnoreCase)).Take(5);
 	if (!searchable.Any()) return "";
@@ -571,7 +607,14 @@ static string SearchProc(string schema, string baseName, string table, List<Colu
 	sb.AppendLine("AS BEGIN");
 	sb.AppendLine(" SET NOCOUNT ON;");
 	sb.AppendLine($" SELECT * FROM {table}");
-	sb.AppendLine($" WHERE @Search IS NULL OR ({conditions})");
+	sb.AppendLine($" WHERE (@Search IS NULL OR ({conditions}))");
+
+	if (enableSoftDelete && softDeleteCol != null)
+	{
+		var condition = softDeleteCol.Name.Contains("IsActive") ? "= 1" : "= 0";
+		sb.AppendLine($"   AND [{softDeleteCol.Name}] {condition}");
+	}
+
 	sb.AppendLine(" ORDER BY (SELECT NULL)");
 	sb.AppendLine(" OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;");
 	sb.AppendLine("END");
