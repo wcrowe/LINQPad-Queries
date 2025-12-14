@@ -217,16 +217,21 @@ static List<string> LoadPrimaryKey(SqlConnection conn, string schema, string tab
 }
 
 // ─────────────────────────────────────────────
-// Audit Detection
+// Audit Detection (enhanced)
 // ─────────────────────────────────────────────
 static (Column? Created, Column? Updated) DetectAuditColumns(List<Column> columns)
 {
+	var createdPatterns = new[] { "Created", "CreatedOn", "CreatedAt", "DateCreated" };
+	var updatedPatterns = new[] { "Updated", "UpdatedOn", "UpdatedAt", "DateUpdated", "LastModified" };
+
 	var created = columns.FirstOrDefault(c =>
-		c.Name.Contains("Created", StringComparison.OrdinalIgnoreCase) &&
-		c.TypeName.Contains("date", StringComparison.OrdinalIgnoreCase));
+		createdPatterns.Any(p => c.Name.Contains(p, StringComparison.OrdinalIgnoreCase)) &&
+		(c.TypeName.Contains("date", StringComparison.OrdinalIgnoreCase) || c.TypeName == "datetime2"));
+
 	var updated = columns.FirstOrDefault(c =>
-		c.Name.Contains("Updated", StringComparison.OrdinalIgnoreCase) &&
-		c.TypeName.Contains("date", StringComparison.OrdinalIgnoreCase));
+		updatedPatterns.Any(p => c.Name.Contains(p, StringComparison.OrdinalIgnoreCase)) &&
+		(c.TypeName.Contains("date", StringComparison.OrdinalIgnoreCase) || c.TypeName == "datetime2"));
+
 	return (created, updated);
 }
 
@@ -394,19 +399,19 @@ static string UpdateProc(string schema, string baseName, string table, List<Colu
 
 // ─────────────────────────────────────────────
 // New Upsert: Separate UPDATE then INSERT (better performance)
+// UpsertProc (now with audit columns)
 // ─────────────────────────────────────────────
 static string UpsertProc(string schema, string baseName, string table, List<Column> insertable, List<Column> updatable, List<Column> columns, List<Column> pk, Column? identity, Column? created, Column? updated)
 {
 	var proc = $"[{schema}].[{baseName}_Upsert]";
 	bool isIdentityPk = identity != null && pk.Count == 1 && pk[0].Name == identity.Name;
 
-	// All unique data columns (insertable + updatable, no PK)
 	var allDataColumns = insertable.Concat(updatable)
 		.GroupBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
 		.Select(g => g.First())
 		.ToList();
 
-	// Parameters: PK (with OUTPUT if identity) + non-PK data columns
+	// Parameters: PK + non-PK data columns (exclude audit columns)
 	var parms = new List<string>();
 	foreach (var p in pk)
 	{
@@ -418,6 +423,7 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 
 	var nonPkDataColumns = allDataColumns
 		.Where(c => !pk.Any(p => p.Name.Equals(c.Name, StringComparison.OrdinalIgnoreCase)))
+		.Where(c => c != created && c != updated)  // exclude audit columns
 		.ToList();
 
 	parms.AddRange(nonPkDataColumns.Select(ParamDecl));
@@ -431,7 +437,9 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 	sb.AppendLine(" BEGIN TRY");
 	sb.AppendLine("  BEGIN TRANSACTION;");
 
-	// UPDATE first (only if row exists)
+	var pkWhere = string.Join(" AND ", pk.Select(p => $"t.[{p.Name}] = @{p.Name}"));
+
+	// UPDATE: update data + Updated column
 	var updateSets = nonPkDataColumns.Select(c => $"[{c.Name}] = @{c.Name}").ToList();
 	if (updated != null)
 		updateSets.Add($"[{updated.Name}] = SYSUTCDATETIME()");
@@ -441,15 +449,20 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 		sb.AppendLine($"  UPDATE t SET");
 		sb.AppendLine("   " + string.Join(",\r\n   ", updateSets));
 		sb.AppendLine($"  FROM {table} t");
-		sb.AppendLine($"  WHERE {string.Join(" AND ", pk.Select(p => $"t.[{p.Name}] = @{p.Name}"))};");
+		sb.AppendLine($"  WHERE {pkWhere};");
 		sb.AppendLine();
 	}
 
-	// INSERT if no row was updated
+	// INSERT if no update occurred
 	sb.AppendLine($"  IF @@ROWCOUNT = 0");
 	sb.AppendLine("  BEGIN");
 
-	var insertFields = columns.Where(c => !c.IsIdentity && !c.IsComputed).Select(c => $"[{c.Name}]").ToList();
+	var insertFields = columns
+		.Where(c => !c.IsIdentity && !c.IsComputed)
+		.Where(c => c != created && c != updated || created == c || updated == c)  // include audit
+		.Select(c => $"[{c.Name}]")
+		.ToList();
+
 	var insertValues = insertFields.Select(f =>
 	{
 		var colName = f.Trim('[', ']');
@@ -464,24 +477,19 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 	sb.AppendLine($"    VALUES ({string.Join(", ", insertValues)});");
 
 	if (isIdentityPk)
-	{
 		sb.AppendLine($"    SET @{identity!.Name} = SCOPE_IDENTITY();");
-	}
 
 	sb.AppendLine("  END");
 
 	sb.AppendLine("  COMMIT TRANSACTION;");
 
-	// Return the affected row
 	sb.AppendLine();
-	sb.AppendLine($"  SELECT * FROM {table} t WHERE {string.Join(" AND ", pk.Select(p => $"t.[{p.Name}] = @{p.Name}"))};");
+	sb.AppendLine($"  SELECT * FROM {table} t WHERE {pkWhere};");
 	sb.AppendLine("  SELECT 1 AS RowsAffected;");
 
 	sb.AppendLine(" END TRY");
 	sb.AppendLine(" BEGIN CATCH");
-	sb.AppendLine("  IF @@TRANCOUNT > 0");
-	sb.AppendLine("   ROLLBACK TRANSACTION;");
-	sb.AppendLine();
+	sb.AppendLine("  IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;");
 	sb.AppendLine("  DECLARE @ErrorMessage nvarchar(4000) = ERROR_MESSAGE();");
 	sb.AppendLine("  DECLARE @ErrorSeverity int = ERROR_SEVERITY();");
 	sb.AppendLine("  DECLARE @ErrorState int = ERROR_STATE();");
