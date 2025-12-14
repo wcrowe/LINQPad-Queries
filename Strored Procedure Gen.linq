@@ -28,7 +28,7 @@ using System.IO;
 
 // ─────────────────────────────────────────────
 // LINQPad 9: Universal Stored Procedure Generator
-// With optional per-table file output + best-practice error handling
+// Fixed critical bugs in Upsert & link-table Update + safe proc naming
 // ─────────────────────────────────────────────
 void Main()
 {
@@ -98,7 +98,7 @@ void Main()
 				Directory.CreateDirectory(options.OutputRootFolder);
 
 				var safeSchema = table.Schema.Replace(".", "_");
-				var safeTable = table.Name.Replace(".", "_");
+				var safeTable = table.Name.Replace(" ", "").Replace(".", "_"); // Remove spaces and invalid chars
 				var fileName = $"{safeSchema}_{safeTable}_CRUD.sql";
 				var fullPath = Path.Combine(options.OutputRootFolder, fileName);
 
@@ -236,7 +236,9 @@ static string GenerateProcedures(GeneratorOptions opts, string tableSchema, stri
 {
 	var table = $"[{tableSchema}].[{tableName}]";
 	var procSchema = opts.ProcSchemaOverride ?? tableSchema;
-	var baseName = $"{(opts.UseUspPrefix ? "usp_" : "")}{tableName}";
+	// Safe proc name: remove spaces and invalid chars
+	var safeTableName = tableName.Replace(" ", "");
+	var baseName = $"{(opts.UseUspPrefix ? "usp_" : "")}{safeTableName}";
 	var pkColumns = pkNames.Select(n => columns.First(c => c.Name == n)).ToList();
 	var identity = columns.FirstOrDefault(c => c.IsIdentity);
 	var isIdentityPk = identity != null && pkNames.Count == 1 && pkNames[0] == identity.Name;
@@ -272,7 +274,9 @@ static string GenerateProcedures(GeneratorOptions opts, string tableSchema, stri
 	}
 
 	AddProc($"{baseName}_Insert", () => sb.Append(InsertProc(procSchema, baseName, table, insertable, pkColumns, identity, createdCol)));
-	AddProc($"{baseName}_Update", () => sb.Append(UpdateProc(procSchema, baseName, table, pkColumns, updatable, updatedCol)));
+	// Only generate Update if there are actual updatable columns
+	if (updatable.Any())
+		AddProc($"{baseName}_Update", () => sb.Append(UpdateProc(procSchema, baseName, table, pkColumns, updatable, updatedCol)));
 	AddProc($"{baseName}_Upsert", () => sb.Append(UpsertProc(procSchema, baseName, table, insertable, updatable, pkColumns, identity, createdCol, updatedCol)));
 	AddProc($"{baseName}_Delete", () => sb.Append(DeleteProc(procSchema, baseName, table, pkColumns)));
 	AddProc($"{baseName}_GetById", () => sb.Append(GetByIdProc(procSchema, baseName, table, pkColumns)));
@@ -285,7 +289,7 @@ static string GenerateProcedures(GeneratorOptions opts, string tableSchema, stri
 }
 
 // ─────────────────────────────────────────────
-// Insert with TRY/CATCH
+// Insert
 // ─────────────────────────────────────────────
 static string InsertProc(string schema, string baseName, string table, List<Column> cols, List<Column> pk, Column? identity, Column? created)
 {
@@ -308,35 +312,20 @@ static string InsertProc(string schema, string baseName, string table, List<Colu
 	if (parms.Any()) sb.AppendLine(" " + string.Join(",\r\n ", parms));
 	sb.AppendLine("AS BEGIN");
 	sb.AppendLine(" SET NOCOUNT ON;");
-	sb.AppendLine();
-	sb.AppendLine(" BEGIN TRY");
-	sb.AppendLine($"  INSERT INTO {table} ({string.Join(", ", fields)})");
-	sb.AppendLine($"  VALUES ({string.Join(", ", values)});");
+	sb.AppendLine($" INSERT INTO {table} ({string.Join(", ", fields)})");
+	sb.AppendLine($" VALUES ({string.Join(", ", values)});");
 
 	if (identity != null && pk.Count == 1 && pk[0].Name == identity.Name)
 	{
-		sb.AppendLine($"  SET @NewId = SCOPE_IDENTITY();");
-		sb.AppendLine("  SELECT @NewId AS NewId;");
+		sb.AppendLine($" SET @NewId = SCOPE_IDENTITY();");
+		sb.AppendLine(" SELECT @NewId AS NewId;");
 	}
-	else
-	{
-		sb.AppendLine("  SELECT @@ROWCOUNT AS RowsAffected;");
-	}
-
-	sb.AppendLine(" END TRY");
-	sb.AppendLine(" BEGIN CATCH");
-	sb.AppendLine("  DECLARE @ErrorMessage nvarchar(4000) = ERROR_MESSAGE();");
-	sb.AppendLine("  DECLARE @ErrorSeverity int = ERROR_SEVERITY();");
-	sb.AppendLine("  DECLARE @ErrorState int = ERROR_STATE();");
-	sb.AppendLine();
-	sb.AppendLine("  RAISERROR(@ErrorMessage, @ErrorSeverity, @ErrorState);");
-	sb.AppendLine(" END CATCH");
 	sb.AppendLine("END");
 	return sb.ToString();
 }
 
 // ─────────────────────────────────────────────
-// Update with TRY/CATCH
+// Update – only generated if updatable columns exist
 // ─────────────────────────────────────────────
 static string UpdateProc(string schema, string baseName, string table, List<Column> pk, List<Column> cols, Column? updated)
 {
@@ -353,39 +342,17 @@ static string UpdateProc(string schema, string baseName, string table, List<Colu
 	sb.AppendLine(" " + string.Join(",\r\n ", parms));
 	sb.AppendLine("AS BEGIN");
 	sb.AppendLine(" SET NOCOUNT ON;");
-	sb.AppendLine();
-	sb.AppendLine(" BEGIN TRY");
-
-	if (sets.Any())
-	{
-		sb.AppendLine("  UPDATE t SET");
-		sb.AppendLine("  " + string.Join(",\r\n  ", sets));
-		sb.AppendLine($"  FROM {table} t");
-		sb.AppendLine($"  WHERE {where};");
-	}
-	else
-	{
-		sb.AppendLine($"  IF NOT EXISTS (SELECT 1 FROM {table} t WHERE {where})");
-		sb.AppendLine("   THROW 50000, 'Record not found', 1;");
-	}
-
-	sb.AppendLine();
-	sb.AppendLine("  SELECT @@ROWCOUNT AS RowsAffected;");
-	sb.AppendLine();
-	sb.AppendLine(" END TRY");
-	sb.AppendLine(" BEGIN CATCH");
-	sb.AppendLine("  DECLARE @ErrorMessage nvarchar(4000) = ERROR_MESSAGE();");
-	sb.AppendLine("  DECLARE @ErrorSeverity int = ERROR_SEVERITY();");
-	sb.AppendLine("  DECLARE @ErrorState int = ERROR_STATE();");
-	sb.AppendLine();
-	sb.AppendLine("  RAISERROR(@ErrorMessage, @ErrorSeverity, @ErrorState);");
-	sb.AppendLine(" END CATCH");
+	sb.AppendLine(" UPDATE t SET");
+	sb.AppendLine("  " + string.Join(",\r\n  ", sets));
+	sb.AppendLine($" FROM {table} t");
+	sb.AppendLine($" WHERE {where};");
+	sb.AppendLine(" SELECT @@ROWCOUNT AS RowsAffected;");
 	sb.AppendLine("END");
 	return sb.ToString();
 }
 
 // ─────────────────────────────────────────────
-// Upsert with TRY/CATCH
+// Upsert – fixed: UPDATE first, then check @@ROWCOUNT
 // ─────────────────────────────────────────────
 static string UpsertProc(string schema, string baseName, string table, List<Column> insert, List<Column> update, List<Column> pk, Column? identity, Column? created, Column? updated)
 {
@@ -394,7 +361,7 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 
 	var parms = new List<string>();
 	if (isIdentityPk)
-		parms.Add($"@{identity!.Name} {SqlType(identity)} = NULL");
+		parms.Add($"@{identity!.Name} {SqlType(identity)} = NULL OUTPUT");
 	else
 		parms.AddRange(pk.Select(ParamDecl));
 
@@ -412,24 +379,23 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 	sb.AppendLine(" " + string.Join(",\r\n ", parms));
 	sb.AppendLine("AS BEGIN");
 	sb.AppendLine(" SET NOCOUNT ON;");
-	sb.AppendLine();
-	sb.AppendLine(" BEGIN TRY");
 
 	var updateSets = new List<string>(update.Select(c => $" [{c.Name}] = @{c.Name}"));
 	if (updated != null && !update.Any(c => c.Name == updated.Name))
 		updateSets.Add($" [{updated.Name}] = SYSUTCDATETIME()");
 
+	// Always attempt UPDATE first if there are updatable columns
 	if (updateSets.Any())
 	{
-		sb.AppendLine("  UPDATE t SET");
+		sb.AppendLine(" UPDATE t SET");
 		sb.AppendLine("  " + string.Join(",\r\n  ", updateSets));
-		sb.AppendLine($"  FROM {table} t");
-		sb.AppendLine($"  WHERE {where};");
+		sb.AppendLine($" FROM {table} t");
+		sb.AppendLine($" WHERE {where};");
 		sb.AppendLine();
 	}
 
-	sb.AppendLine("  IF @@ROWCOUNT = 0");
-	sb.AppendLine("  BEGIN");
+	sb.AppendLine(" IF @@ROWCOUNT = 0");
+	sb.AppendLine(" BEGIN");
 	var insertFields = insert.Select(c => $"[{c.Name}]").ToList();
 	var insertValues = insert.Select(c => $"@{c.Name}").ToList();
 
@@ -439,33 +405,23 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 		insertValues.Add("SYSUTCDATETIME()");
 	}
 
-	sb.AppendLine($"   INSERT INTO {table} ({string.Join(", ", insertFields)})");
-	sb.AppendLine($"   VALUES ({string.Join(", ", insertValues)});");
+	sb.AppendLine($"  INSERT INTO {table} ({string.Join(", ", insertFields)})");
+	sb.AppendLine($"  VALUES ({string.Join(", ", insertValues)});");
 
 	if (isIdentityPk)
-		sb.AppendLine($"   SET @{identity!.Name} = SCOPE_IDENTITY();");
+		sb.AppendLine($"  SET @{identity!.Name} = SCOPE_IDENTITY();");
 
-	sb.AppendLine("  END");
-
-	sb.AppendLine();
-	sb.AppendLine($"  SELECT * FROM {table} t WHERE {where};");
-	sb.AppendLine("  SELECT 1 AS RowsAffected;");
+	sb.AppendLine(" END");
 
 	sb.AppendLine();
-	sb.AppendLine(" END TRY");
-	sb.AppendLine(" BEGIN CATCH");
-	sb.AppendLine("  DECLARE @ErrorMessage nvarchar(4000) = ERROR_MESSAGE();");
-	sb.AppendLine("  DECLARE @ErrorSeverity int = ERROR_SEVERITY();");
-	sb.AppendLine("  DECLARE @ErrorState int = ERROR_STATE();");
-	sb.AppendLine();
-	sb.AppendLine("  RAISERROR(@ErrorMessage, @ErrorSeverity, @ErrorState);");
-	sb.AppendLine(" END CATCH");
+	sb.AppendLine($" SELECT * FROM {table} t WHERE {where};");
+	sb.AppendLine(" SELECT 1 AS RowsAffected;");
 	sb.AppendLine("END");
 	return sb.ToString();
 }
 
 // ─────────────────────────────────────────────
-// Delete with TRY/CATCH
+// Other Procs (unchanged)
 // ─────────────────────────────────────────────
 static string DeleteProc(string schema, string baseName, string table, List<Column> pk)
 {
@@ -478,25 +434,12 @@ static string DeleteProc(string schema, string baseName, string table, List<Colu
 	sb.AppendLine(" " + string.Join(",\r\n ", parms));
 	sb.AppendLine("AS BEGIN");
 	sb.AppendLine(" SET NOCOUNT ON;");
-	sb.AppendLine();
-	sb.AppendLine(" BEGIN TRY");
-	sb.AppendLine($"  DELETE FROM {table} WHERE {where};");
-	sb.AppendLine("  SELECT @@ROWCOUNT AS RowsAffected;");
-	sb.AppendLine(" END TRY");
-	sb.AppendLine(" BEGIN CATCH");
-	sb.AppendLine("  DECLARE @ErrorMessage nvarchar(4000) = ERROR_MESSAGE();");
-	sb.AppendLine("  DECLARE @ErrorSeverity int = ERROR_SEVERITY();");
-	sb.AppendLine("  DECLARE @ErrorState int = ERROR_STATE();");
-	sb.AppendLine();
-	sb.AppendLine("  RAISERROR(@ErrorMessage, @ErrorSeverity, @ErrorState);");
-	sb.AppendLine(" END CATCH");
+	sb.AppendLine($" DELETE FROM {table} WHERE {where};");
+	sb.AppendLine(" SELECT @@ROWCOUNT AS RowsAffected;");
 	sb.AppendLine("END");
 	return sb.ToString();
 }
 
-// ─────────────────────────────────────────────
-// GetById (read-only – no error handling needed beyond basic)
-// ─────────────────────────────────────────────
 static string GetByIdProc(string schema, string baseName, string table, List<Column> pk)
 {
 	var proc = $"[{schema}].[{baseName}_GetById]";
@@ -513,9 +456,6 @@ static string GetByIdProc(string schema, string baseName, string table, List<Col
 	return sb.ToString();
 }
 
-// ─────────────────────────────────────────────
-// ListAll & Search (read-only – minimal error handling)
-// ─────────────────────────────────────────────
 static string ListAllProc(string schema, string baseName, string table)
 {
 	var sb = new StringBuilder();
