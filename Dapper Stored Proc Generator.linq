@@ -24,7 +24,6 @@
 // Generates C# (Dapper) stored procedure CALL methods from existing stored procedures.
 // Outputs everything to Results and (optionally) writes to: C:\dve\GernerateeDapper
 
-
 using System;
 using System.Collections.Generic;
 using System.Data;
@@ -42,22 +41,22 @@ using Microsoft.Data.SqlClient;
 // CONFIGURATION (do not change defaults unless explicitly asked)
 // ────────────────────────────────────────────────────────────────────────────────
 const bool SaveToDisk = true; // still outputs to Results either way
-string OutputDir = @"c:\dev\GernerateeDapper";
+readonly string OutputDir = @"c:\dve\GernerateeDapper";
 
 // Preserve existing scope expectation (same correct source as before).
-// Default: include stored procedures whose name targets Articles or AspNet*.
-Regex IncludeProcNameRegex = new Regex(@"(?i)\b(Articles|AspNet)\b|^(Articles|AspNet)", RegexOptions.Compiled);
+// FIX: Support common naming like usp_Articles_* and usp_AspNet* by allowing optional usp_ prefix.
+Regex IncludeProcNameRegex = new Regex(@"(?i)^(?:usp_)?(Articles|AspNet)\b|\b(Articles|AspNet)\b", RegexOptions.Compiled);
 
 // Optional: schema filter (empty = all)
 HashSet<string> IncludeSchemas = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
 {
-	 "dbo"
+	// "dbo"
 };
 
 // Naming (do not change unless explicitly asked)
 const string DefaultProcPrefixToTrim = "usp_";
 
-// Composite param object feature (new): if a procedure has >= this many parameters,
+// Composite param object feature: if a procedure has >= this many parameters,
 // generate a strongly-typed request record and an overload taking that record.
 const int GenerateRequestRecordThreshold = 6;
 
@@ -279,7 +278,7 @@ static string GenerateDapperRepositoryCode(
 	sb.AppendLine("\tprivate static string QuoteProc(string schema, string name) => $\"[{schema}].[{name}]\";");
 	sb.AppendLine();
 
-	// Request records (new feature)
+	// Request records (generated when parameter count is high)
 	var requestRecords = storedProcedures
 		.Where(p => p.Parameters.Count >= GenerateRequestRecordThreshold)
 		.Select(GenerateRequestRecord)
@@ -320,20 +319,17 @@ static string GenerateDapperRepositoryCode(
 			var csName = ToPascal(ToSafeIdentifier(prm.Name));
 			var csType = prm.IsTableType ? "DataTable" : MapSqlTypeToCSharp(prm);
 
-			// OUTPUT params are represented as nullable so callers can omit initial values
 			if (prm.IsOutput)
 			{
 				csType = MakeNullableIfValueType(csType);
 			}
 
-			// Nullability for ref-types
 			if (!prm.IsTableType)
 			{
 				csType = ApplyNullability(csType, prm.IsNullable);
 			}
 			else
 			{
-				// DataTable typically non-null; allow nullable if declared nullable in SQL
 				if (prm.IsNullable) csType = "DataTable?";
 			}
 
@@ -351,16 +347,13 @@ static string GenerateDapperRepositoryCode(
 		var recordName = ToSafeTypeName(methodBaseName + "Request");
 		var procQuoted = $"QuoteProc(\"{proc.Schema}\", \"{proc.Name}\")";
 
-		// Heuristic: query-ish names => Query; else Execute
 		var isQuery = Regex.IsMatch(proc.Name, @"(?i)\b(Get|Select|List|Search|Fetch|Read|Query)\b")
 			|| proc.Name.Contains("Get", StringComparison.OrdinalIgnoreCase)
 			|| proc.Name.Contains("List", StringComparison.OrdinalIgnoreCase)
 			|| proc.Name.Contains("Search", StringComparison.OrdinalIgnoreCase);
 
-		// If there are OUTPUT params, return outputs as dictionary (name->object?)
 		var hasOutput = proc.Parameters.Any(p => p.IsOutput);
 
-		// Build parameters
 		var signatureParams = new List<string>();
 		var dpAdds = new List<string>();
 
@@ -371,7 +364,6 @@ static string GenerateDapperRepositoryCode(
 
 			if (prm.IsOutput)
 			{
-				// Dapper output values: we pass initial value (often null) and retrieve after execution
 				csType = MakeNullableIfValueType(csType);
 			}
 			else
@@ -384,7 +376,6 @@ static string GenerateDapperRepositoryCode(
 
 			signatureParams.Add($"{csType} {csArgName}");
 
-			// DynamicParameters
 			var dbType = MapSqlTypeToDbType(prm.SqlTypeName);
 			var dbTypeArg = dbType is null ? "null" : $"DbType.{dbType}";
 			var direction = prm.IsOutput ? "ParameterDirection.InputOutput" : "ParameterDirection.Input";
@@ -395,22 +386,15 @@ static string GenerateDapperRepositoryCode(
 			);
 		}
 
-		var ctSig = "CancellationToken cancellationToken = default";
+		const string ctSig = "CancellationToken cancellationToken = default";
 		var argsWithCt = signatureParams.Count == 0
 			? ctSig
 			: string.Join(", ", signatureParams) + ", " + ctSig;
 
-		var argsNoCt = signatureParams.Count == 0
-			? string.Empty
-			: string.Join(", ", signatureParams);
-
-		// New composite feature: request-record overload for high-param procs
 		var generateRequestOverload = proc.Parameters.Count >= GenerateRequestRecordThreshold && proc.Parameters.Count > 0;
 
-		// Decide method signatures
 		if (isQuery)
 		{
-			// Query: generic result list (caller supplies T)
 			var returnType = hasOutput
 				? $"Task<(IReadOnlyList<T> Rows, IReadOnlyDictionary<string, object?> Output)>"
 				: "Task<IReadOnlyList<T>>";
@@ -458,14 +442,7 @@ static string GenerateDapperRepositoryCode(
 				sb.AppendLine("\t\tif (request is null) throw new ArgumentNullException(nameof(request));");
 
 				var callArgs = string.Join(", ", proc.Parameters.Select(p => $"request.{ToPascal(ToSafeIdentifier(p.Name))}"));
-				if (string.IsNullOrWhiteSpace(callArgs))
-				{
-					sb.AppendLine($"\t\treturn {methodBaseName}Async<T>({ctSig.Split('=')[0].Trim()});");
-				}
-				else
-				{
-					sb.AppendLine($"\t\treturn {methodBaseName}Async<T>({callArgs}, cancellationToken);");
-				}
+				sb.AppendLine($"\t\treturn {methodBaseName}Async<T>({callArgs}, cancellationToken);");
 
 				sb.AppendLine("\t}");
 				sb.AppendLine();
@@ -473,7 +450,6 @@ static string GenerateDapperRepositoryCode(
 		}
 		else
 		{
-			// Execute: returns rows affected (and outputs if any)
 			var returnType = hasOutput
 				? "Task<(int RowsAffected, IReadOnlyDictionary<string, object?> Output)>"
 				: "Task<int>";
@@ -521,14 +497,7 @@ static string GenerateDapperRepositoryCode(
 				sb.AppendLine("\t\tif (request is null) throw new ArgumentNullException(nameof(request));");
 
 				var callArgs = string.Join(", ", proc.Parameters.Select(p => $"request.{ToPascal(ToSafeIdentifier(p.Name))}"));
-				if (string.IsNullOrWhiteSpace(callArgs))
-				{
-					sb.AppendLine($"\t\treturn {methodBaseName}Async({ctSig.Split('=')[0].Trim()});");
-				}
-				else
-				{
-					sb.AppendLine($"\t\treturn {methodBaseName}Async({callArgs}, cancellationToken);");
-				}
+				sb.AppendLine($"\t\treturn {methodBaseName}Async({callArgs}, cancellationToken);");
 
 				sb.AppendLine("\t}");
 				sb.AppendLine();
@@ -544,8 +513,6 @@ static string GenerateDapperRepositoryCode(
 // ────────────────────────────────────────────────────────────────────────────────
 static string MapSqlTypeToCSharp(StoredProcedureParam prm)
 {
-	// Important: Keep simple, stable mappings; unknown => object?
-	// Nullability handled separately.
 	var t = prm.SqlTypeName.ToLowerInvariant();
 
 	return t switch
@@ -642,14 +609,12 @@ static string? MapSqlTypeToDbType(string sqlTypeName)
 
 static string BuildSizeArg(StoredProcedureParam prm)
 {
-	// Dapper supports "size" for strings/binary. For NVARCHAR etc, SQL max_length is bytes.
-	// For nvarchar/nchar: bytes / 2
 	if (prm.MaxLength is null) return string.Empty;
 
 	var t = prm.SqlTypeName.ToLowerInvariant();
 	var maxLength = prm.MaxLength.Value;
 
-	if (maxLength <= 0) return string.Empty; // includes -1 (MAX) or 0
+	if (maxLength <= 0) return string.Empty; // includes -1 (MAX)
 
 	if (t is "nvarchar" or "nchar")
 	{
@@ -667,8 +632,6 @@ static string BuildSizeArg(StoredProcedureParam prm)
 
 static string ApplyNullability(string csType, bool isNullable)
 {
-	// ref-types: string, byte[], object, DataTable already nullable by nature (but allow explicit ? for string?).
-	// value-types: add ?
 	if (!isNullable) return csType;
 
 	if (csType is "string" or "byte[]" or "object")
@@ -680,7 +643,6 @@ static string ApplyNullability(string csType, bool isNullable)
 	if (csType.EndsWith("?", StringComparison.Ordinal))
 		return csType;
 
-	// likely value type
 	return csType + "?";
 }
 
@@ -704,16 +666,13 @@ static string TrimPrefix(string name, string prefix)
 
 static string ToSafeMethodName(string name)
 {
-	// Replace invalid chars, then PascalCase tokens
 	var cleaned = Regex.Replace(name, @"[^\w]+", "_");
 	cleaned = Regex.Replace(cleaned, @"_+", "_").Trim('_');
 	if (string.IsNullOrWhiteSpace(cleaned)) cleaned = "Proc";
 
-	// Keep underscores as token boundaries
 	var parts = cleaned.Split('_', StringSplitOptions.RemoveEmptyEntries);
 	var pascal = string.Concat(parts.Select(ToPascal));
 
-	// C# keywords
 	if (IsCSharpKeyword(pascal))
 		pascal = "@" + pascal;
 
@@ -723,7 +682,6 @@ static string ToSafeMethodName(string name)
 static string ToSafeTypeName(string name)
 {
 	var n = ToSafeMethodName(name);
-	// Type name should not start with '@'
 	return n.StartsWith("@", StringComparison.Ordinal) ? n.Substring(1) : n;
 }
 
@@ -751,7 +709,6 @@ static string ToPascal(string s)
 {
 	if (string.IsNullOrWhiteSpace(s)) return string.Empty;
 
-	// Preserve existing PascalCase segments while normalizing separators
 	var tokens = Regex.Split(s, @"[_\s\-]+").Where(t => t.Length > 0);
 	var sb = new StringBuilder();
 	foreach (var t in tokens)
@@ -762,29 +719,24 @@ static string ToPascal(string s)
 			continue;
 		}
 
-		// If token is already mixed-case, keep first as upper but keep rest as-is
 		sb.Append(char.ToUpperInvariant(t[0]));
 		sb.Append(t.Substring(1));
 	}
+
 	var res = sb.ToString();
 
-	// If starts with digit, prefix underscore
 	if (res.Length > 0 && char.IsDigit(res[0]))
 		res = "_" + res;
 
-	// Handle keyword
 	if (IsCSharpKeyword(res))
 		res = "@" + res;
 
 	return res;
 }
 
-static bool IsCSharpKeyword(string s)
-{
-	// minimal set; enough to avoid obvious collisions
-	return s is
+static bool IsCSharpKeyword(string s) =>
+	s is
 		"class" or "namespace" or "public" or "private" or "protected" or "internal" or
 		"void" or "string" or "object" or "int" or "long" or "short" or "byte" or "bool" or
 		"decimal" or "double" or "float" or "return" or "new" or "record" or "params" or
 		"ref" or "out" or "in" or "base" or "this" or "event" or "operator" or "default";
-}
