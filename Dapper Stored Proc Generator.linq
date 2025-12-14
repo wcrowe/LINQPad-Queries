@@ -44,14 +44,25 @@ const bool SaveToDisk = true; // still outputs to Results either way
 readonly string OutputDir = @"c:\dve\GernerateeDapper";
 
 // Preserve existing scope expectation (same correct source as before).
-// FIX: Support common naming like usp_Articles_* and usp_AspNet* by allowing optional usp_ prefix.
-Regex IncludeProcNameRegex = new Regex(@"(?i)^(?:usp_)?(Articles|AspNet)\b|\b(Articles|AspNet)\b", RegexOptions.Compiled);
+// Support common naming like usp_Articles_* and usp_AspNet* by allowing optional usp_ prefix.
+//static readonly Regex IncludeProcNameRegex =
+//	new Regex(@"(?i)^(?:usp_)?(Articles|AspNet)\b|\b(Articles|AspNet)\b", RegexOptions.Compiled);
 
-// Optional: schema filter (empty = all)
-HashSet<string> IncludeSchemas = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-{
-	// "dbo"
-};
+//// Optional: schema filter (empty = all)
+//static readonly HashSet<string> IncludeSchemas = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+//{
+//	// "dbo"
+//};
+
+// To include ALL stored procedures, comment out or remove the regex/schema filters
+//static readonly Regex IncludeProcNameRegex = null; // null = include all
+//static readonly HashSet<string> IncludeSchemas = new(); // empty = include all schemas
+
+// Include ALL procedures (recommended for full generation)
+//static readonly Regex IncludeProcNameRegex = new Regex(".*", RegexOptions.Compiled); // matches everything
+// Only your custom usp_ procedures
+static readonly Regex IncludeProcNameRegex = new Regex(@"^usp_", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+static readonly HashSet<string> IncludeSchemas = new(); // all schemas
 
 // Naming (do not change unless explicitly asked)
 const string DefaultProcPrefixToTrim = "usp_";
@@ -106,14 +117,21 @@ sealed record StoredProcedureModel(
 
 sealed record StoredProcedureParam(
 	string Name,              // without @
-	string SqlTypeName,        // e.g. "nvarchar", "int"
+	string SqlTypeName,        // e.g. "nvarchar", "int" (for TVP this is the *user type name*)
+	string? SchemaNameForType, // for TVP, schema owning the type
 	int? MaxLength,            // bytes for (n)varchar/(n)char; -1 for MAX
 	byte Precision,            // decimal/numeric
 	byte Scale,                // decimal/numeric
 	bool IsNullable,
 	bool IsOutput,
 	bool IsTableType
-);
+)
+{
+	public string? TableTypeFullName =>
+		IsTableType
+			? $"[{(SchemaNameForType ?? "dbo")}].[{SqlTypeName}]"
+			: null;
+}
 
 // ────────────────────────────────────────────────────────────────────────────────
 // LOAD METADATA
@@ -123,13 +141,16 @@ static async Task<List<StoredProcedureModel>> LoadStoredProceduresAsync(
 	HashSet<string> includeSchemas,
 	Regex includeProcNameRegex)
 {
+	// Note: for TVPs, sys.types.name = user-defined table type name, and typ.is_table_type = 1
+	// We also pull the schema owning the type so we can generate AsTableValuedParameter("[schema].[TypeName]")
 	const string sql = @"
 SELECT
-	s.name  AS SchemaName,
+	s.name  AS ProcSchemaName,
 	p.name  AS ProcName,
 	prm.parameter_id,
 	prm.name AS ParamName,
 	typ.name AS TypeName,
+	typs.name AS TypeSchemaName,
 	prm.max_length,
 	prm.precision,
 	prm.scale,
@@ -143,6 +164,8 @@ LEFT JOIN sys.parameters prm
 	ON prm.object_id = p.object_id
 LEFT JOIN sys.types typ
 	ON typ.user_type_id = prm.user_type_id
+LEFT JOIN sys.schemas typs
+	ON typs.schema_id = typ.schema_id
 WHERE p.is_ms_shipped = 0
 ORDER BY s.name, p.name, prm.parameter_id;";
 
@@ -154,7 +177,7 @@ ORDER BY s.name, p.name, prm.parameter_id;";
 	var grouped = rows
 		.GroupBy(r => new
 		{
-			Schema = (string)r.SchemaName,
+			Schema = (string)r.ProcSchemaName,
 			Name = (string)r.ProcName
 		})
 		.Select(g =>
@@ -175,6 +198,7 @@ ORDER BY s.name, p.name, prm.parameter_id;";
 					paramName = paramName[1..];
 
 				string typeName = (r.TypeName as string) ?? "sql_variant";
+				string? typeSchemaName = r.TypeSchemaName as string;
 
 				int? maxLength = null;
 				try { if (r.max_length is not null) maxLength = (int)r.max_length; } catch { }
@@ -194,6 +218,7 @@ ORDER BY s.name, p.name, prm.parameter_id;";
 				parms.Add(new StoredProcedureParam(
 					Name: paramName,
 					SqlTypeName: typeName,
+					SchemaNameForType: typeSchemaName,
 					MaxLength: maxLength,
 					Precision: precision,
 					Scale: scale,
@@ -239,6 +264,8 @@ static string GenerateDapperRepositoryCode(
 	sb.AppendLine("using System;");
 	sb.AppendLine("using System.Collections.Generic;");
 	sb.AppendLine("using System.Data;");
+	sb.AppendLine("using System.Globalization;");
+	sb.AppendLine("using System.Linq;");
 	sb.AppendLine("using System.Threading;");
 	sb.AppendLine("using System.Threading.Tasks;");
 	sb.AppendLine("using Dapper;");
@@ -278,9 +305,9 @@ static string GenerateDapperRepositoryCode(
 	sb.AppendLine("\tprivate static string QuoteProc(string schema, string name) => $\"[{schema}].[{name}]\";");
 	sb.AppendLine();
 
-	// Request records (generated when parameter count is high)
+	// Request records
 	var requestRecords = storedProcedures
-		.Where(p => p.Parameters.Count >= GenerateRequestRecordThreshold)
+		.Where(p => p.Parameters.Count >= GenerateRequestRecordThreshold && p.Parameters.Count > 0)
 		.Select(GenerateRequestRecord)
 		.Where(s => !string.IsNullOrWhiteSpace(s))
 		.ToList();
@@ -309,29 +336,13 @@ static string GenerateDapperRepositoryCode(
 	// ────────────────────────────────────────────────────────────────────────────
 	static string GenerateRequestRecord(StoredProcedureModel proc)
 	{
-		if (proc.Parameters.Count == 0) return string.Empty;
-
 		var recordName = ToSafeTypeName(ToSafeMethodName(TrimPrefix(proc.Name, DefaultProcPrefixToTrim)) + "Request");
 
 		var props = new List<string>();
 		foreach (var prm in proc.Parameters)
 		{
 			var csName = ToPascal(ToSafeIdentifier(prm.Name));
-			var csType = prm.IsTableType ? "DataTable" : MapSqlTypeToCSharp(prm);
-
-			if (prm.IsOutput)
-			{
-				csType = MakeNullableIfValueType(csType);
-			}
-
-			if (!prm.IsTableType)
-			{
-				csType = ApplyNullability(csType, prm.IsNullable);
-			}
-			else
-			{
-				if (prm.IsNullable) csType = "DataTable?";
-			}
+			var csType = MapParamToCSharpType(prm);
 
 			props.Add($"{csType} {csName}");
 		}
@@ -347,11 +358,7 @@ static string GenerateDapperRepositoryCode(
 		var recordName = ToSafeTypeName(methodBaseName + "Request");
 		var procQuoted = $"QuoteProc(\"{proc.Schema}\", \"{proc.Name}\")";
 
-		var isQuery = Regex.IsMatch(proc.Name, @"(?i)\b(Get|Select|List|Search|Fetch|Read|Query)\b")
-			|| proc.Name.Contains("Get", StringComparison.OrdinalIgnoreCase)
-			|| proc.Name.Contains("List", StringComparison.OrdinalIgnoreCase)
-			|| proc.Name.Contains("Search", StringComparison.OrdinalIgnoreCase);
-
+		var isQuery = LooksLikeQuery(proc.Name);
 		var hasOutput = proc.Parameters.Any(p => p.IsOutput);
 
 		var signatureParams = new List<string>();
@@ -360,30 +367,29 @@ static string GenerateDapperRepositoryCode(
 		foreach (var prm in proc.Parameters)
 		{
 			var csArgName = ToCamel(ToSafeIdentifier(prm.Name));
-			var csType = prm.IsTableType ? "DataTable" : MapSqlTypeToCSharp(prm);
-
-			if (prm.IsOutput)
-			{
-				csType = MakeNullableIfValueType(csType);
-			}
-			else
-			{
-				csType = ApplyNullability(csType, prm.IsNullable);
-			}
-
-			if (prm.IsTableType && prm.IsNullable)
-				csType = "DataTable?";
+			var csType = MapParamToCSharpType(prm);
 
 			signatureParams.Add($"{csType} {csArgName}");
+
+			if (prm.IsTableType)
+			{
+				// TVP: must pass AsTableValuedParameter with the DB type name.
+				// If null allowed, pass null; otherwise pass dt.AsTableValuedParameter("[schema].[Type]")
+				var tvpType = prm.TableTypeFullName ?? $"[dbo].[{prm.SqlTypeName}]";
+				var valueExpr = prm.IsNullable
+					? $"{csArgName} is null ? null : {csArgName}.AsTableValuedParameter(\"{tvpType}\")"
+					: $"{csArgName}.AsTableValuedParameter(\"{tvpType}\")";
+
+				dpAdds.Add($"\t\t\tdp.Add(\"@{prm.Name}\", {valueExpr});");
+				continue;
+			}
 
 			var dbType = MapSqlTypeToDbType(prm.SqlTypeName);
 			var dbTypeArg = dbType is null ? "null" : $"DbType.{dbType}";
 			var direction = prm.IsOutput ? "ParameterDirection.InputOutput" : "ParameterDirection.Input";
 			var sizeArg = BuildSizeArg(prm);
 
-			dpAdds.Add(
-				$"\t\t\tdp.Add(\"@{prm.Name}\", {csArgName}, {dbTypeArg}, {direction}{sizeArg});"
-			);
+			dpAdds.Add($"\t\t\tdp.Add(\"@{prm.Name}\", {csArgName}, {dbTypeArg}, {direction}{sizeArg});");
 		}
 
 		const string ctSig = "CancellationToken cancellationToken = default";
@@ -419,9 +425,7 @@ static string GenerateDapperRepositoryCode(
 				sb.AppendLine();
 				sb.AppendLine("\t\tvar output = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);");
 				foreach (var prm in proc.Parameters.Where(p => p.IsOutput))
-				{
 					sb.AppendLine($"\t\toutput[\"{prm.Name}\"] = dp.Get<object?>(\"@{prm.Name}\");");
-				}
 				sb.AppendLine("\t\treturn (rows, output);");
 			}
 			else
@@ -443,7 +447,6 @@ static string GenerateDapperRepositoryCode(
 
 				var callArgs = string.Join(", ", proc.Parameters.Select(p => $"request.{ToPascal(ToSafeIdentifier(p.Name))}"));
 				sb.AppendLine($"\t\treturn {methodBaseName}Async<T>({callArgs}, cancellationToken);");
-
 				sb.AppendLine("\t}");
 				sb.AppendLine();
 			}
@@ -474,9 +477,7 @@ static string GenerateDapperRepositoryCode(
 				sb.AppendLine();
 				sb.AppendLine("\t\tvar output = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);");
 				foreach (var prm in proc.Parameters.Where(p => p.IsOutput))
-				{
 					sb.AppendLine($"\t\toutput[\"{prm.Name}\"] = dp.Get<object?>(\"@{prm.Name}\");");
-				}
 				sb.AppendLine("\t\treturn (rowsAffected, output);");
 			}
 			else
@@ -498,13 +499,30 @@ static string GenerateDapperRepositoryCode(
 
 				var callArgs = string.Join(", ", proc.Parameters.Select(p => $"request.{ToPascal(ToSafeIdentifier(p.Name))}"));
 				sb.AppendLine($"\t\treturn {methodBaseName}Async({callArgs}, cancellationToken);");
-
 				sb.AppendLine("\t}");
 				sb.AppendLine();
 			}
 		}
 
 		return sb.ToString();
+	}
+
+	static bool LooksLikeQuery(string procName)
+		=> Regex.IsMatch(procName, @"(?i)\b(Get|Select|List|Search|Fetch|Read|Query)\b")
+		   || procName.Contains("Get", StringComparison.OrdinalIgnoreCase)
+		   || procName.Contains("List", StringComparison.OrdinalIgnoreCase)
+		   || procName.Contains("Search", StringComparison.OrdinalIgnoreCase);
+
+	static string MapParamToCSharpType(StoredProcedureParam prm)
+	{
+		if (prm.IsTableType)
+		{
+			// For TVP, accept DataTable (caller fills columns).
+			return prm.IsNullable ? "DataTable?" : "DataTable";
+		}
+
+		var baseType = MapSqlTypeToCSharp(prm);
+		return ApplyNullability(baseType, prm.IsNullable || prm.IsOutput);
 	}
 }
 
@@ -634,23 +652,15 @@ static string ApplyNullability(string csType, bool isNullable)
 {
 	if (!isNullable) return csType;
 
-	if (csType is "string" or "byte[]" or "object")
+	// reference types
+	if (csType is "string" or "byte[]" or "object" || csType.EndsWith("[]", StringComparison.Ordinal))
 		return csType + "?";
 
-	if (csType.EndsWith("[]", StringComparison.Ordinal))
-		return csType + "?";
-
+	// already nullable
 	if (csType.EndsWith("?", StringComparison.Ordinal))
 		return csType;
 
-	return csType + "?";
-}
-
-static string MakeNullableIfValueType(string csType)
-{
-	if (csType.EndsWith("?", StringComparison.Ordinal)) return csType;
-	if (csType is "string" or "object") return csType + "?";
-	if (csType.EndsWith("[]", StringComparison.Ordinal)) return csType + "?";
+	// value types
 	return csType + "?";
 }
 
