@@ -7,7 +7,7 @@
     <AllowDateOnlyTimeOnly>true</AllowDateOnlyTimeOnly>
     <UseMicrosoftDataSqlClient>true</UseMicrosoftDataSqlClient>
     <EncryptTraffic>true</EncryptTraffic>
-    <Database>BlazorBlogDb</Database>
+    <Database>NW</Database>
     <MapXmlToString>false</MapXmlToString>
     <DriverData>
       <SkipCertificateCheck>true</SkipCertificateCheck>
@@ -29,11 +29,11 @@ using System.IO;
 // ─────────────────────────────────────────────
 // LINQPad 9: Universal Stored Procedure Generator
 // Features:
-// - Separate UPDATE + INSERT for Upsert (better performance than MERGE)
-// - Full transaction + TRY/CATCH
-// - Audit columns (Created*/Updated*) auto-filled with SYSUTCDATETIME()
-// - Soft delete support (IsDeleted/IsActive bit column)
-// - Clean, safe, production-ready code
+// - Separate UPDATE + INSERT for Upsert
+// - Audit columns (Created/Updated)
+// - Soft delete (with restore/undelete)
+// - Pagination for ListAll/Search (OFFSET/FETCH)
+// - Row versioning (ConcurrencyStamp or RowVersion column)
 // ─────────────────────────────────────────────
 void Main()
 {
@@ -46,7 +46,8 @@ void Main()
 		IncludeListAll = true,
 		IncludeSearch = true,
 		EnableAuditTrail = true,
-		EnableSoftDelete = true,                 // Set to false if you don't want soft delete
+		EnableSoftDelete = true,
+		EnableVersioning = true,                   // ← NEW: Row versioning
 		ExcludedTablePatterns = new[] { "__EFMigrationsHistory" },
 		OutputRootFolder = @"C:\dev\SqlCrudProcs",
 		SavePerTableFiles = true
@@ -70,7 +71,7 @@ void Main()
 	var master = new StringBuilder();
 	master.AppendLine("-- =================================================");
 	master.AppendLine("-- Auto-Generated CRUD Stored Procedures");
-	master.AppendLine("-- Features: Upsert (UPDATE+INSERT), Audit, Soft Delete");
+	master.AppendLine("-- Features: Upsert, Audit, Soft Delete (+Restore), Pagination, Versioning");
 	master.AppendLine($"-- Database: {conn.Database}");
 	master.AppendLine($"-- Generated: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
 	master.AppendLine("-- =================================================");
@@ -147,6 +148,7 @@ sealed class GeneratorOptions
 	public bool IncludeSearch { get; init; } = true;
 	public bool EnableAuditTrail { get; init; } = true;
 	public bool EnableSoftDelete { get; init; } = true;
+	public bool EnableVersioning { get; init; } = true;
 	public string[] ExcludedTablePatterns { get; init; } = Array.Empty<string>();
 	public string? OutputRootFolder { get; init; } = @"C:\dev\SqlCrudProcs";
 	public bool SavePerTableFiles { get; init; } = true;
@@ -156,10 +158,10 @@ sealed class GeneratorOptions
 // Models
 // ─────────────────────────────────────────────
 record Table(string Schema, string Name);
-record Column(string Name, string TypeName, int? MaxLength, byte Precision, byte Scale, bool IsNullable, bool IsIdentity, bool IsComputed);
+record Column(string Name, string TypeName, int? MaxLength, byte Precision, byte Scale, bool IsNullable, bool IsIdentity, bool IsComputed, bool IsRowVersion);
 
 // ─────────────────────────────────────────────
-// Metadata
+// Metadata (added IsRowVersion)
 // ─────────────────────────────────────────────
 static List<Table> LoadTables(SqlConnection conn)
 {
@@ -174,7 +176,8 @@ static List<Table> LoadTables(SqlConnection conn)
 static List<Column> LoadColumns(SqlConnection conn, string schema, string table)
 {
 	const string sql = @"
-        SELECT c.name, ty.name, c.max_length, c.precision, c.scale, c.is_nullable, c.is_identity, c.is_computed
+        SELECT c.name, ty.name, c.max_length, c.precision, c.scale, c.is_nullable, c.is_identity, c.is_computed, 
+               CASE WHEN ty.name = 'timestamp' THEN 1 ELSE 0 END AS is_rowversion
         FROM sys.columns c
         JOIN sys.types ty ON ty.user_type_id = c.user_type_id
         JOIN sys.tables t ON t.object_id = c.object_id
@@ -196,7 +199,8 @@ static List<Column> LoadColumns(SqlConnection conn, string schema, string table)
 			r.IsDBNull(4) ? (byte)0 : r.GetByte(4),
 			r.GetBoolean(5),
 			r.GetBoolean(6),
-			r.GetBoolean(7)
+			r.GetBoolean(7),
+			r.GetInt32(8) == 1  // ← Explicit conversion to bool
 		));
 	}
 	return list;
@@ -224,13 +228,14 @@ static List<string> LoadPrimaryKey(SqlConnection conn, string schema, string tab
 }
 
 // ─────────────────────────────────────────────
-// Audit + Soft Delete Detection
+// Special Column Detection
 // ─────────────────────────────────────────────
-static (Column? Created, Column? Updated, Column? SoftDelete) DetectSpecialColumns(List<Column> columns)
+static (Column? Created, Column? Updated, Column? SoftDelete, Column? Version) DetectSpecialColumns(List<Column> columns)
 {
 	var createdPatterns = new[] { "Created", "CreatedOn", "CreatedAt", "DateCreated" };
 	var updatedPatterns = new[] { "Updated", "UpdatedOn", "UpdatedAt", "DateUpdated", "LastModified" };
 	var softDeletePatterns = new[] { "IsDeleted", "Deleted", "IsActive", "Active" };
+	var versionPatterns = new[] { "ConcurrencyStamp", "RowVersion", "Version", "Timestamp" };
 
 	var created = columns.FirstOrDefault(c =>
 		createdPatterns.Any(p => c.Name.Contains(p, StringComparison.OrdinalIgnoreCase)) &&
@@ -244,11 +249,15 @@ static (Column? Created, Column? Updated, Column? SoftDelete) DetectSpecialColum
 		softDeletePatterns.Any(p => c.Name.Contains(p, StringComparison.OrdinalIgnoreCase)) &&
 		c.TypeName == "bit");
 
-	return (created, updated, softDelete);
+	var version = columns.FirstOrDefault(c =>
+		versionPatterns.Any(p => c.Name.Contains(p, StringComparison.OrdinalIgnoreCase)) &&
+		(c.TypeName == "timestamp" || c.IsRowVersion || c.TypeName.Contains("stamp", StringComparison.OrdinalIgnoreCase)));
+
+	return (created, updated, softDelete, version);
 }
 
 // ─────────────────────────────────────────────
-// Generation
+// Generation (added versioning check)
 // ─────────────────────────────────────────────
 static string GenerateProcedures(GeneratorOptions opts, string tableSchema, string tableName, List<Column> columns, List<string> pkNames)
 {
@@ -264,7 +273,8 @@ static string GenerateProcedures(GeneratorOptions opts, string tableSchema, stri
 		!c.IsIdentity &&
 		!c.IsComputed &&
 		!(opts.EnableAuditTrail && (c.Name.Contains("Created", StringComparison.OrdinalIgnoreCase) || c.Name.Contains("Updated", StringComparison.OrdinalIgnoreCase))) &&
-		!(opts.EnableSoftDelete && (c.Name.Contains("IsDeleted", StringComparison.OrdinalIgnoreCase) || c.Name.Contains("IsActive", StringComparison.OrdinalIgnoreCase))))
+		!(opts.EnableSoftDelete && (c.Name.Contains("IsDeleted", StringComparison.OrdinalIgnoreCase) || c.Name.Contains("IsActive", StringComparison.OrdinalIgnoreCase))) &&
+		!(opts.EnableVersioning && c.IsRowVersion))
 		.ToList();
 
 	var updatable = columns.Where(c =>
@@ -272,15 +282,16 @@ static string GenerateProcedures(GeneratorOptions opts, string tableSchema, stri
 		!c.IsIdentity &&
 		!c.IsComputed &&
 		!(opts.EnableAuditTrail && (c.Name.Contains("Created", StringComparison.OrdinalIgnoreCase) || c.Name.Contains("Updated", StringComparison.OrdinalIgnoreCase))) &&
-		!(opts.EnableSoftDelete && (c.Name.Contains("IsDeleted", StringComparison.OrdinalIgnoreCase) || c.Name.Contains("IsActive", StringComparison.OrdinalIgnoreCase))))
+		!(opts.EnableSoftDelete && (c.Name.Contains("IsDeleted", StringComparison.OrdinalIgnoreCase) || c.Name.Contains("IsActive", StringComparison.OrdinalIgnoreCase))) &&
+		!(opts.EnableVersioning && c.IsRowVersion))
 		.ToList();
 
-	var (createdCol, updatedCol, softDeleteCol) = DetectSpecialColumns(columns);
+	var (createdCol, updatedCol, softDeleteCol, versionCol) = DetectSpecialColumns(columns);
 
 	var sb = new StringBuilder();
 	sb.AppendLine($"-- CRUD Procedures for {table}");
-	if (createdCol != null || updatedCol != null || softDeleteCol != null)
-		sb.AppendLine($"-- Special: {(createdCol != null ? "Created" : "")} {(updatedCol != null ? "Updated" : "")} {(softDeleteCol != null ? "SoftDelete" : "")}".Trim());
+	if (createdCol != null || updatedCol != null || softDeleteCol != null || versionCol != null)
+		sb.AppendLine($"-- Special: {(createdCol != null ? "Created" : "")} {(updatedCol != null ? "Updated" : "")} {(softDeleteCol != null ? "SoftDelete" : "")} {(versionCol != null ? "Versioning" : "")}".Trim());
 	sb.AppendLine();
 
 	void AddProc(string name, Action generator)
@@ -294,11 +305,13 @@ static string GenerateProcedures(GeneratorOptions opts, string tableSchema, stri
 		sb.AppendLine();
 	}
 
-	AddProc($"{baseName}_Insert", () => sb.Append(InsertProc(procSchema, baseName, table, insertable, pkColumns, identity, createdCol, updatedCol, softDeleteCol)));
+	AddProc($"{baseName}_Insert", () => sb.Append(InsertProc(procSchema, baseName, table, insertable, pkColumns, identity, createdCol, updatedCol, softDeleteCol, versionCol)));
 	if (updatable.Any() || updatedCol != null)
-		AddProc($"{baseName}_Update", () => sb.Append(UpdateProc(procSchema, baseName, table, pkColumns, updatable, updatedCol, softDeleteCol)));
-	AddProc($"{baseName}_Upsert", () => sb.Append(UpsertProc(procSchema, baseName, table, insertable, updatable, columns, pkColumns, identity, createdCol, updatedCol, softDeleteCol)));
+		AddProc($"{baseName}_Update", () => sb.Append(UpdateProc(procSchema, baseName, table, pkColumns, updatable, updatedCol, versionCol)));
+	AddProc($"{baseName}_Upsert", () => sb.Append(UpsertProc(procSchema, baseName, table, insertable, updatable, columns, pkColumns, identity, createdCol, updatedCol, softDeleteCol, versionCol)));
 	AddProc($"{baseName}_Delete", () => sb.Append(DeleteProc(procSchema, baseName, table, pkColumns, softDeleteCol, opts.EnableSoftDelete)));
+	if (opts.EnableSoftDelete && softDeleteCol != null)
+		AddProc($"{baseName}_Restore", () => sb.Append(RestoreProc(procSchema, baseName, table, pkColumns, softDeleteCol)));
 	AddProc($"{baseName}_GetById", () => sb.Append(GetByIdProc(procSchema, baseName, table, pkColumns, softDeleteCol, opts.EnableSoftDelete)));
 	if (opts.IncludeListAll)
 		AddProc($"{baseName}_ListAll", () => sb.Append(ListAllProc(procSchema, baseName, table, softDeleteCol, opts.EnableSoftDelete)));
@@ -309,9 +322,9 @@ static string GenerateProcedures(GeneratorOptions opts, string tableSchema, stri
 }
 
 // ─────────────────────────────────────────────
-// Insert (with audit + soft delete init)
+// Insert (with audit, soft delete, versioning init)
 // ─────────────────────────────────────────────
-static string InsertProc(string schema, string baseName, string table, List<Column> cols, List<Column> pk, Column? identity, Column? created, Column? updated, Column? softDelete)
+static string InsertProc(string schema, string baseName, string table, List<Column> cols, List<Column> pk, Column? identity, Column? created, Column? updated, Column? softDelete, Column? version)
 {
 	var proc = $"[{schema}].[{baseName}_Insert]";
 	var fields = cols.Select(c => $"[{c.Name}]").ToList();
@@ -334,6 +347,12 @@ static string InsertProc(string schema, string baseName, string table, List<Colu
 	{
 		fields.Add($"[{softDelete.Name}]");
 		values.Add(softDelete.Name.Contains("IsActive") ? "1" : "0");
+	}
+
+	if (version != null && !version.IsRowVersion)  // If manual versioning stamp, init it
+	{
+		fields.Add($"[{version.Name}]");
+		values.Add("NEWID()");  // or whatever initial value, e.g., GUID
 	}
 
 	if (identity != null && pk.Count == 1 && pk[0].Name == identity.Name)
@@ -367,17 +386,25 @@ static string InsertProc(string schema, string baseName, string table, List<Colu
 }
 
 // ─────────────────────────────────────────────
-// Update (audit Updated column only)
+// Update (with audit + versioning check)
 // ─────────────────────────────────────────────
-static string UpdateProc(string schema, string baseName, string table, List<Column> pk, List<Column> cols, Column? updated, Column? softDelete)
+static string UpdateProc(string schema, string baseName, string table, List<Column> pk, List<Column> cols, Column? updated, Column? version)
 {
 	var proc = $"[{schema}].[{baseName}_Update]";
 	var parms = pk.Select(ParamDecl).Concat(cols.Select(ParamDecl)).ToList();
+	if (version != null)
+		parms.Add(ParamDecl(version));
+
 	var sets = new List<string>(cols.Select(c => $" [{c.Name}] = @{c.Name}"));
 	if (updated != null)
 		sets.Add($" [{updated.Name}] = SYSUTCDATETIME()");
 
+	if (version != null && !version.IsRowVersion)
+		sets.Add($" [{version.Name}] = NEWID()");  // Bump manual version
+
 	var where = string.Join(" AND ", pk.Select(c => $"t.[{c.Name}] = @{c.Name}"));
+	if (version != null)
+		where += $" AND t.[{version.Name}] = @{version.Name}";  // Optimistic concurrency
 
 	var sb = new StringBuilder();
 	sb.AppendLine($"CREATE OR ALTER PROCEDURE {proc}");
@@ -398,7 +425,7 @@ static string UpdateProc(string schema, string baseName, string table, List<Colu
 	else
 	{
 		sb.AppendLine($"  IF NOT EXISTS (SELECT 1 FROM {table} t WHERE {where})");
-		sb.AppendLine("   THROW 50000, 'Record not found', 1;");
+		sb.AppendLine("   THROW 50000, 'Record not found or version mismatch', 1;");
 		sb.AppendLine("  SELECT 0 AS RowsAffected;");
 	}
 
@@ -414,9 +441,9 @@ static string UpdateProc(string schema, string baseName, string table, List<Colu
 }
 
 // ─────────────────────────────────────────────
-// Upsert with audit + soft delete
+// Upsert (with audit, soft delete, versioning)
 // ─────────────────────────────────────────────
-static string UpsertProc(string schema, string baseName, string table, List<Column> insertable, List<Column> updatable, List<Column> columns, List<Column> pk, Column? identity, Column? created, Column? updated, Column? softDelete)
+static string UpsertProc(string schema, string baseName, string table, List<Column> insertable, List<Column> updatable, List<Column> columns, List<Column> pk, Column? identity, Column? created, Column? updated, Column? softDelete, Column? version)
 {
 	var proc = $"[{schema}].[{baseName}_Upsert]";
 	bool isIdentityPk = identity != null && pk.Count == 1 && pk[0].Name == identity.Name;
@@ -437,10 +464,13 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 
 	var nonPkDataColumns = allDataColumns
 		.Where(c => !pk.Any(p => p.Name.Equals(c.Name, StringComparison.OrdinalIgnoreCase)))
-		.Where(c => c != created && c != updated && c != softDelete)
+		.Where(c => c != created && c != updated && c != softDelete && c != version)
 		.ToList();
 
 	parms.AddRange(nonPkDataColumns.Select(ParamDecl));
+
+	if (version != null)
+		parms.Add(ParamDecl(version));
 
 	var sb = new StringBuilder();
 	sb.AppendLine($"CREATE OR ALTER PROCEDURE {proc}");
@@ -452,11 +482,15 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 	sb.AppendLine("  BEGIN TRANSACTION;");
 
 	var pkWhere = string.Join(" AND ", pk.Select(p => $"t.[{p.Name}] = @{p.Name}"));
+	if (version != null)
+		pkWhere += $" AND t.[{version.Name}] = @{version.Name}";  // Concurrency check
 
 	// UPDATE
 	var updateSets = nonPkDataColumns.Select(c => $"[{c.Name}] = @{c.Name}").ToList();
 	if (updated != null)
 		updateSets.Add($"[{updated.Name}] = SYSUTCDATETIME()");
+	if (version != null && !version.IsRowVersion)
+		updateSets.Add($"[{version.Name}] = NEWID()");
 
 	if (updateSets.Any())
 	{
@@ -481,6 +515,8 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 			return "SYSUTCDATETIME()";
 		if (softDelete != null && colName.Equals(softDelete.Name, StringComparison.OrdinalIgnoreCase))
 			return softDelete.Name.Contains("IsActive") ? "1" : "0";
+		if (version != null && !version.IsRowVersion && colName.Equals(version.Name, StringComparison.OrdinalIgnoreCase))
+			return "NEWID()";
 		return $"@{colName}";
 	}).ToList();
 
@@ -495,7 +531,7 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 	sb.AppendLine("  COMMIT TRANSACTION;");
 
 	sb.AppendLine();
-	sb.AppendLine($"  SELECT * FROM {table} t WHERE {pkWhere};");
+	sb.AppendLine($"  SELECT * FROM {table} t WHERE {string.Join(" AND ", pk.Select(p => $"t.[{p.Name}] = @{p.Name}"))};");
 	sb.AppendLine("  SELECT 1 AS RowsAffected;");
 
 	sb.AppendLine(" END TRY");
@@ -511,7 +547,7 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 }
 
 // ─────────────────────────────────────────────
-// Soft Delete (or hard delete if disabled)
+// Delete (soft delete with restore)
 // ─────────────────────────────────────────────
 static string DeleteProc(string schema, string baseName, string table, List<Column> pk, Column? softDeleteCol, bool enableSoftDelete)
 {
@@ -549,8 +585,37 @@ static string DeleteProc(string schema, string baseName, string table, List<Colu
 	return sb.ToString();
 }
 
+static string RestoreProc(string schema, string baseName, string table, List<Column> pk, Column? softDeleteCol)
+{
+	var proc = $"[{schema}].[{baseName}_Restore]";
+	var parms = pk.Select(ParamDecl).ToList();
+	var where = string.Join(" AND ", pk.Select(c => $"[{c.Name}] = @{c.Name}"));
+
+	var sb = new StringBuilder();
+	sb.AppendLine($"CREATE OR ALTER PROCEDURE {proc}");
+	sb.AppendLine(" " + string.Join(",\r\n ", parms));
+	sb.AppendLine("AS BEGIN");
+	sb.AppendLine(" SET NOCOUNT ON;");
+	sb.AppendLine();
+	sb.AppendLine(" BEGIN TRY");
+
+	var flagValue = softDeleteCol!.Name.Contains("IsActive") ? "1" : "0";
+	sb.AppendLine($"  UPDATE {table} SET [{softDeleteCol.Name}] = {flagValue} WHERE {where};");
+
+	sb.AppendLine("  SELECT @@ROWCOUNT AS RowsAffected;");
+	sb.AppendLine(" END TRY");
+	sb.AppendLine(" BEGIN CATCH");
+	sb.AppendLine("  DECLARE @ErrorMessage nvarchar(4000) = ERROR_MESSAGE();");
+	sb.AppendLine("  DECLARE @ErrorSeverity int = ERROR_SEVERITY();");
+	sb.AppendLine("  DECLARE @ErrorState int = ERROR_STATE();");
+	sb.AppendLine("  RAISERROR(@ErrorMessage, @ErrorSeverity, @ErrorState);");
+	sb.AppendLine(" END CATCH");
+	sb.AppendLine("END");
+	return sb.ToString();
+}
+
 // ─────────────────────────────────────────────
-// Read procedures (filter soft-deleted)
+// Read procedures (with soft delete filter)
 // ─────────────────────────────────────────────
 static string GetByIdProc(string schema, string baseName, string table, List<Column> pk, Column? softDeleteCol, bool enableSoftDelete)
 {
@@ -580,6 +645,8 @@ static string ListAllProc(string schema, string baseName, string table, Column? 
 {
 	var sb = new StringBuilder();
 	sb.AppendLine($"CREATE OR ALTER PROCEDURE [{schema}].[{baseName}_ListAll]");
+	sb.AppendLine(" @Offset int = 0");
+	sb.AppendLine(" ,@Fetch int = 100");
 	sb.AppendLine("AS BEGIN");
 	sb.AppendLine(" SET NOCOUNT ON;");
 	sb.AppendLine($" SELECT * FROM {table}");
@@ -590,6 +657,8 @@ static string ListAllProc(string schema, string baseName, string table, Column? 
 		sb.AppendLine($" WHERE [{softDeleteCol.Name}] {condition}");
 	}
 
+	sb.AppendLine(" ORDER BY (SELECT NULL)");
+	sb.AppendLine(" OFFSET @Offset ROWS FETCH NEXT @Fetch ROWS ONLY;");
 	sb.AppendLine("END");
 	return sb.ToString();
 }
@@ -604,6 +673,8 @@ static string SearchProc(string schema, string baseName, string table, List<Colu
 	var sb = new StringBuilder();
 	sb.AppendLine($"CREATE OR ALTER PROCEDURE [{schema}].[{baseName}_Search]");
 	sb.AppendLine(" @Search nvarchar(200) = NULL");
+	sb.AppendLine(" ,@Offset int = 0");
+	sb.AppendLine(" ,@Fetch int = 100");
 	sb.AppendLine("AS BEGIN");
 	sb.AppendLine(" SET NOCOUNT ON;");
 	sb.AppendLine($" SELECT * FROM {table}");
@@ -616,7 +687,7 @@ static string SearchProc(string schema, string baseName, string table, List<Colu
 	}
 
 	sb.AppendLine(" ORDER BY (SELECT NULL)");
-	sb.AppendLine(" OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;");
+	sb.AppendLine(" OFFSET @Offset ROWS FETCH NEXT @Fetch ROWS ONLY;");
 	sb.AppendLine("END");
 	return sb.ToString();
 }
