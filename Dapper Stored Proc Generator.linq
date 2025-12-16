@@ -23,6 +23,57 @@
 // LINQPad 9 / .NET 10
 // Generates C# (Dapper) stored procedure CALL methods from existing stored procedures.
 // Outputs everything to Results and (optionally) writes to: C:\dve\GernerateeDapper
+/*
+1.Basic Setup(DI Registration)
+C#
+// In Program.cs or Startup.cs
+services.AddSingleton<IDbConnectionFactory>(new SqlConnectionFactory(connectionString));
+
+// Usage
+var caller = new StoredProcedureCaller(connectionFactory);
+2.Simple CRUD Examples
+C#
+// Query (returns data)
+var categories = await caller.CategoriesListAllAsync<Category>();
+var category = await caller.CategoriesGetByIdAsync<Category>(1);
+
+// Non-query (returns rows affected)
+await caller.CategoriesDeleteAsync(5);
+
+// Complex with output params
+var (rowsAffected, output) = await caller.CategoriesInsertAsync(
+	categoryName: "New Category",
+	description: "Description",
+	picture: null,
+	newId: null // output param
+);
+var newCategoryId = (int?)output["NewId"];
+3.Using Request Records(for 6+ parameters)
+C#
+// Much cleaner than 11 individual parameters!
+var customer = new CustomersInsertRequest(
+	CustomerID: "ALFKI",
+	CompanyName: "Alfreds Futterkiste",
+	ContactName: "Maria Anders",
+	ContactTitle: "Sales Representative",
+	Address: "Obere Str. 57",
+	City: "Berlin",
+	Region: null,
+	PostalCode: "12209",
+	Country: "Germany",
+	Phone: "030-0074321",
+	Fax: "030-0076545"
+);
+
+await caller.CustomersInsertAsync(customer);
+4.Generic Type Safety
+C#
+// T is your POCO - works with any strongly-typed model
+public record Category(int CategoryID, string CategoryName, string? Description);
+
+var categories = await caller.CategoriesListAllAsync<Category>();
+// Dapper maps columns to properties automatically
+*/
 
 using System;
 using System.Collections.Generic;
@@ -41,7 +92,7 @@ using Microsoft.Data.SqlClient;
 // CONFIGURATION (do not change defaults unless explicitly asked)
 // ────────────────────────────────────────────────────────────────────────────────
 const bool SaveToDisk = true; // still outputs to Results either way
-readonly string OutputDir = @"c:\dve\GernerateeDapper";
+readonly string OutputDir = @"c:\dev\GeneratedDapper";
 
 // Preserve existing scope expectation (same correct source as before).
 // Support common naming like usp_Articles_* and usp_AspNet* by allowing optional usp_ prefix.
@@ -69,8 +120,8 @@ const string DefaultProcPrefixToTrim = "usp_";
 
 // Composite param object feature: if a procedure has >= this many parameters,
 // generate a strongly-typed request record and an overload taking that record.
-const int GenerateRequestRecordThreshold = 6;
-
+//const int GenerateRequestRecordThreshold = 6;
+const int GenerateRequestRecordThreshold = 5;
 // ────────────────────────────────────────────────────────────────────────────────
 // MAIN
 // ────────────────────────────────────────────────────────────────────────────────
@@ -676,6 +727,8 @@ static string TrimPrefix(string name, string prefix)
 
 static string ToSafeMethodName(string name)
 {
+	name = TrimPrefix(name, DefaultProcPrefixToTrim);
+	name = name.Replace(" ", ""); // removes the space in "Order Details" → OrderDetailsX
 	var cleaned = Regex.Replace(name, @"[^\w]+", "_");
 	cleaned = Regex.Replace(cleaned, @"_+", "_").Trim('_');
 	if (string.IsNullOrWhiteSpace(cleaned)) cleaned = "Proc";
