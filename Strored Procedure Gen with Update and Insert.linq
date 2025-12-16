@@ -29,12 +29,13 @@ using System.IO;
 // ─────────────────────────────────────────────
 // LINQPad 9: Universal Stored Procedure Generator
 // Features:
+// - Full composite primary key support
 // - Separate UPDATE + INSERT for Upsert
 // - Audit columns (Created/Updated)
 // - Soft delete (with restore/undelete)
 // - Pagination for ListAll/Search (OFFSET/FETCH)
 // - Row versioning (ConcurrencyStamp or RowVersion column)
-// - SELECT uses explicit column lists instead of SELECT *
+// - Explicit SELECT column lists (no SELECT *)
 // ─────────────────────────────────────────────
 void Main()
 {
@@ -52,9 +53,9 @@ void Main()
 		ExcludedTablePatterns = new[] { "__EFMigrationsHistory" },
 		OutputRootFolder = @"C:\dev\SqlCrudProcs",
 		SavePerTableFiles = true,
-		ExcludeAuditFromSelect = true,             // ← NEW: Hide audit columns from SELECTs
-		ExcludeSoftDeleteFlagFromSelect = true,    // ← NEW: Hide IsDeleted/IsActive from SELECTs
-		ExcludeVersionFromSelect = true            // ← NEW: Hide RowVersion/ConcurrencyStamp from SELECTs
+		ExcludeAuditFromSelect = true,
+		ExcludeSoftDeleteFlagFromSelect = true,
+		ExcludeVersionFromSelect = true
 	};
 
 	using var conn = new SqlConnection(this.Connection.ConnectionString);
@@ -75,7 +76,7 @@ void Main()
 	var master = new StringBuilder();
 	master.AppendLine("-- =================================================");
 	master.AppendLine("-- Auto-Generated CRUD Stored Procedures");
-	master.AppendLine("-- Features: Upsert, Audit, Soft Delete (+Restore), Pagination, Versioning, Explicit SELECT columns");
+	master.AppendLine("-- Features: Composite PK support, Upsert, Audit, Soft Delete (+Restore), Pagination, Versioning, Explicit SELECT");
 	master.AppendLine($"-- Database: {conn.Database}");
 	master.AppendLine($"-- Generated: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
 	master.AppendLine("-- =================================================");
@@ -157,7 +158,6 @@ sealed class GeneratorOptions
 	public string? OutputRootFolder { get; init; } = @"C:\dev\SqlCrudProcs";
 	public bool SavePerTableFiles { get; init; } = true;
 
-	// New options for controlling what appears in SELECT statements
 	public bool ExcludeAuditFromSelect { get; init; } = true;
 	public bool ExcludeSoftDeleteFlagFromSelect { get; init; } = true;
 	public bool ExcludeVersionFromSelect { get; init; } = true;
@@ -266,14 +266,14 @@ static (Column? Created, Column? Updated, Column? SoftDelete, Column? Version) D
 }
 
 // ─────────────────────────────────────────────
-// Helper: Columns to include in SELECT statements
+// Selectable columns for output
 // ─────────────────────────────────────────────
 static List<Column> GetSelectableColumns(List<Column> allColumns, GeneratorOptions opts,
 	Column? created, Column? updated, Column? softDelete, Column? version)
 {
 	return allColumns
 		.Where(c =>
-			!c.IsComputed &&                                   // Never return computed columns
+			!c.IsComputed &&
 			!(opts.ExcludeAuditFromSelect && (c == created || c == updated)) &&
 			!(opts.ExcludeSoftDeleteFlagFromSelect && c == softDelete) &&
 			!(opts.ExcludeVersionFromSelect && (c == version || c.IsRowVersion)))
@@ -289,9 +289,11 @@ static string GenerateProcedures(GeneratorOptions opts, string tableSchema, stri
 	var procSchema = opts.ProcSchemaOverride ?? tableSchema;
 	var safeTableName = tableName.Replace(" ", "");
 	var baseName = $"{(opts.UseUspPrefix ? "usp_" : "")}{safeTableName}";
+
 	var pkColumns = pkNames.Select(n => columns.First(c => c.Name == n)).ToList();
 	var identity = columns.FirstOrDefault(c => c.IsIdentity);
-	var isIdentityPk = identity != null && pkNames.Count == 1 && pkNames[0] == identity.Name;
+	var hasIdentity = identity != null;
+	var isSingleIdentityPk = hasIdentity && pkNames.Count == 1 && pkNames[0] == identity.Name;
 
 	var insertable = columns.Where(c =>
 		!c.IsIdentity &&
@@ -312,7 +314,6 @@ static string GenerateProcedures(GeneratorOptions opts, string tableSchema, stri
 
 	var (createdCol, updatedCol, softDeleteCol, versionCol) = DetectSpecialColumns(columns);
 
-	// Pre-calculate the explicit column list for SELECTs
 	var selectableColumns = GetSelectableColumns(columns, opts, createdCol, updatedCol, softDeleteCol, versionCol);
 	var selectList = string.Join(", ", selectableColumns.Select(c => $"t.[{c.Name}]"));
 
@@ -320,6 +321,7 @@ static string GenerateProcedures(GeneratorOptions opts, string tableSchema, stri
 	sb.AppendLine($"-- CRUD Procedures for {table}");
 	if (createdCol != null || updatedCol != null || softDeleteCol != null || versionCol != null)
 		sb.AppendLine($"-- Special: {(createdCol != null ? "Created" : "")} {(updatedCol != null ? "Updated" : "")} {(softDeleteCol != null ? "SoftDelete" : "")} {(versionCol != null ? "Versioning" : "")}".Trim());
+	sb.AppendLine($"-- Primary Key: {string.Join(", ", pkColumns.Select(c => c.Name))} {(pkColumns.Count > 1 ? "(Composite)" : "")}");
 	sb.AppendLine();
 
 	void AddProc(string name, Action generator)
@@ -333,10 +335,10 @@ static string GenerateProcedures(GeneratorOptions opts, string tableSchema, stri
 		sb.AppendLine();
 	}
 
-	AddProc($"{baseName}_Insert", () => sb.Append(InsertProc(procSchema, baseName, table, insertable, pkColumns, identity, createdCol, updatedCol, softDeleteCol, versionCol)));
+	AddProc($"{baseName}_Insert", () => sb.Append(InsertProc(procSchema, baseName, table, insertable, pkColumns, identity, isSingleIdentityPk, createdCol, updatedCol, softDeleteCol, versionCol)));
 	if (updatable.Any() || updatedCol != null)
 		AddProc($"{baseName}_Update", () => sb.Append(UpdateProc(procSchema, baseName, table, pkColumns, updatable, updatedCol, versionCol)));
-	AddProc($"{baseName}_Upsert", () => sb.Append(UpsertProc(procSchema, baseName, table, insertable, updatable, columns, pkColumns, identity, createdCol, updatedCol, softDeleteCol, versionCol, selectList)));
+	AddProc($"{baseName}_Upsert", () => sb.Append(UpsertProc(procSchema, baseName, table, insertable, updatable, columns, pkColumns, isSingleIdentityPk, identity, createdCol, updatedCol, softDeleteCol, versionCol, selectList)));
 	AddProc($"{baseName}_Delete", () => sb.Append(DeleteProc(procSchema, baseName, table, pkColumns, softDeleteCol, opts.EnableSoftDelete)));
 	if (opts.EnableSoftDelete && softDeleteCol != null)
 		AddProc($"{baseName}_Restore", () => sb.Append(RestoreProc(procSchema, baseName, table, pkColumns, softDeleteCol)));
@@ -350,9 +352,9 @@ static string GenerateProcedures(GeneratorOptions opts, string tableSchema, stri
 }
 
 // ─────────────────────────────────────────────
-// Insert
+// Insert – supports composite PK, outputs new identity only if single identity PK
 // ─────────────────────────────────────────────
-static string InsertProc(string schema, string baseName, string table, List<Column> cols, List<Column> pk, Column? identity, Column? created, Column? updated, Column? softDelete, Column? version)
+static string InsertProc(string schema, string baseName, string table, List<Column> cols, List<Column> pk, Column? identity, bool isSingleIdentityPk, Column? created, Column? updated, Column? softDelete, Column? version)
 {
 	var proc = $"[{schema}].[{baseName}_Insert]";
 	var fields = cols.Select(c => $"[{c.Name}]").ToList();
@@ -383,8 +385,8 @@ static string InsertProc(string schema, string baseName, string table, List<Colu
 		values.Add("NEWID()");
 	}
 
-	if (identity != null && pk.Count == 1 && pk[0].Name == identity.Name)
-		parms.Add($"@NewId {SqlType(identity)} OUTPUT");
+	if (isSingleIdentityPk)
+		parms.Add($"@NewId {SqlType(identity!)} OUTPUT");
 
 	var sb = new StringBuilder();
 	sb.AppendLine($"CREATE OR ALTER PROCEDURE {proc}");
@@ -396,7 +398,7 @@ static string InsertProc(string schema, string baseName, string table, List<Colu
 	sb.AppendLine($"  INSERT INTO {table} ({string.Join(", ", fields)})");
 	sb.AppendLine($"  VALUES ({string.Join(", ", values)});");
 
-	if (identity != null && pk.Count == 1 && pk[0].Name == identity.Name)
+	if (isSingleIdentityPk)
 	{
 		sb.AppendLine($"  SET @NewId = SCOPE_IDENTITY();");
 		sb.AppendLine("  SELECT @NewId AS NewId;");
@@ -423,10 +425,9 @@ static string UpdateProc(string schema, string baseName, string table, List<Colu
 	if (version != null)
 		parms.Add(ParamDecl(version));
 
-	var sets = new List<string>(cols.Select(c => $" [{c.Name}] = @{c.Name}"));
+	var sets = cols.Select(c => $" [{c.Name}] = @{c.Name}").ToList();
 	if (updated != null)
 		sets.Add($" [{updated.Name}] = SYSUTCDATETIME()");
-
 	if (version != null && !version.IsRowVersion)
 		sets.Add($" [{version.Name}] = NEWID()");
 
@@ -469,12 +470,11 @@ static string UpdateProc(string schema, string baseName, string table, List<Colu
 }
 
 // ─────────────────────────────────────────────
-// Upsert
+// Upsert – full composite PK support
 // ─────────────────────────────────────────────
-static string UpsertProc(string schema, string baseName, string table, List<Column> insertable, List<Column> updatable, List<Column> columns, List<Column> pk, Column? identity, Column? created, Column? updated, Column? softDelete, Column? version, string selectList)
+static string UpsertProc(string schema, string baseName, string table, List<Column> insertable, List<Column> updatable, List<Column> columns, List<Column> pk, bool isSingleIdentityPk, Column? identity, Column? created, Column? updated, Column? softDelete, Column? version, string selectList)
 {
 	var proc = $"[{schema}].[{baseName}_Upsert]";
-	bool isIdentityPk = identity != null && pk.Count == 1 && pk[0].Name == identity.Name;
 
 	var allDataColumns = insertable.Concat(updatable)
 		.GroupBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
@@ -482,10 +482,11 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 		.ToList();
 
 	var parms = new List<string>();
+	// All PK columns are required inputs (even if identity — caller must provide it for consistency)
 	foreach (var p in pk)
 	{
-		if (isIdentityPk && p.Name == identity!.Name)
-			parms.Add($"@{identity.Name} {SqlType(identity)} = NULL OUTPUT");
+		if (isSingleIdentityPk && p.Name == identity!.Name)
+			parms.Add($"@{p.Name} {SqlType(p)} = NULL OUTPUT");
 		else
 			parms.Add(ParamDecl(p));
 	}
@@ -513,7 +514,6 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 	if (version != null)
 		pkWhere += $" AND t.[{version.Name}] = @{version.Name}";
 
-	// UPDATE
 	var updateSets = nonPkDataColumns.Select(c => $"[{c.Name}] = @{c.Name}").ToList();
 	if (updated != null)
 		updateSets.Add($"[{updated.Name}] = SYSUTCDATETIME()");
@@ -529,7 +529,6 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 		sb.AppendLine();
 	}
 
-	// INSERT
 	sb.AppendLine($"  IF @@ROWCOUNT = 0");
 	sb.AppendLine("  BEGIN");
 
@@ -537,21 +536,17 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 	var insertValues = insertFields.Select(f =>
 	{
 		var colName = f.Trim('[', ']');
-		if (created != null && colName.Equals(created.Name, StringComparison.OrdinalIgnoreCase))
-			return "SYSUTCDATETIME()";
-		if (updated != null && colName.Equals(updated.Name, StringComparison.OrdinalIgnoreCase))
-			return "SYSUTCDATETIME()";
-		if (softDelete != null && colName.Equals(softDelete.Name, StringComparison.OrdinalIgnoreCase))
-			return softDelete.Name.Contains("IsActive") ? "1" : "0";
-		if (version != null && !version.IsRowVersion && colName.Equals(version.Name, StringComparison.OrdinalIgnoreCase))
-			return "NEWID()";
+		if (created != null && colName.Equals(created.Name, StringComparison.OrdinalIgnoreCase)) return "SYSUTCDATETIME()";
+		if (updated != null && colName.Equals(updated.Name, StringComparison.OrdinalIgnoreCase)) return "SYSUTCDATETIME()";
+		if (softDelete != null && colName.Equals(softDelete.Name, StringComparison.OrdinalIgnoreCase)) return softDelete.Name.Contains("IsActive") ? "1" : "0";
+		if (version != null && !version.IsRowVersion && colName.Equals(version.Name, StringComparison.OrdinalIgnoreCase)) return "NEWID()";
 		return $"@{colName}";
 	}).ToList();
 
 	sb.AppendLine($"    INSERT INTO {table} ({string.Join(", ", insertFields)})");
 	sb.AppendLine($"    VALUES ({string.Join(", ", insertValues)});");
 
-	if (isIdentityPk)
+	if (isSingleIdentityPk)
 		sb.AppendLine($"    SET @{identity!.Name} = SCOPE_IDENTITY();");
 
 	sb.AppendLine("  END");
@@ -560,11 +555,11 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 
 	sb.AppendLine();
 	if (string.IsNullOrEmpty(selectList))
-		sb.AppendLine($"  SELECT * FROM {table} t WHERE {string.Join(" AND ", pk.Select(p => $"t.[{p.Name}] = @{p.Name}"))};");
+		sb.AppendLine($"  SELECT * FROM {table} t WHERE {pkWhere.Replace("@", "@p_").Replace("t.", "")};"); // fallback
 	else
 		sb.AppendLine($"  SELECT {selectList} FROM {table} t WHERE {string.Join(" AND ", pk.Select(p => $"t.[{p.Name}] = @{p.Name}"))};");
-	sb.AppendLine("  SELECT 1 AS RowsAffected;");
 
+	sb.AppendLine("  SELECT 1 AS RowsAffected;");
 	sb.AppendLine(" END TRY");
 	sb.AppendLine(" BEGIN CATCH");
 	sb.AppendLine("  IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;");
@@ -578,7 +573,7 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 }
 
 // ─────────────────────────────────────────────
-// Delete / Restore
+// Delete / Restore (composite PK safe)
 // ─────────────────────────────────────────────
 static string DeleteProc(string schema, string baseName, string table, List<Column> pk, Column? softDeleteCol, bool enableSoftDelete)
 {
@@ -607,10 +602,7 @@ static string DeleteProc(string schema, string baseName, string table, List<Colu
 	sb.AppendLine("  SELECT @@ROWCOUNT AS RowsAffected;");
 	sb.AppendLine(" END TRY");
 	sb.AppendLine(" BEGIN CATCH");
-	sb.AppendLine("  DECLARE @ErrorMessage nvarchar(4000) = ERROR_MESSAGE();");
-	sb.AppendLine("  DECLARE @ErrorSeverity int = ERROR_SEVERITY();");
-	sb.AppendLine("  DECLARE @ErrorState int = ERROR_STATE();");
-	sb.AppendLine("  RAISERROR(@ErrorMessage, @ErrorSeverity, @ErrorState);");
+	sb.AppendLine("  RAISERROR(ERROR_MESSAGE(), ERROR_SEVERITY(), ERROR_STATE());");
 	sb.AppendLine(" END CATCH");
 	sb.AppendLine("END");
 	return sb.ToString();
@@ -636,23 +628,20 @@ static string RestoreProc(string schema, string baseName, string table, List<Col
 	sb.AppendLine("  SELECT @@ROWCOUNT AS RowsAffected;");
 	sb.AppendLine(" END TRY");
 	sb.AppendLine(" BEGIN CATCH");
-	sb.AppendLine("  DECLARE @ErrorMessage nvarchar(4000) = ERROR_MESSAGE();");
-	sb.AppendLine("  DECLARE @ErrorSeverity int = ERROR_SEVERITY();");
-	sb.AppendLine("  DECLARE @ErrorState int = ERROR_STATE();");
-	sb.AppendLine("  RAISERROR(@ErrorMessage, @ErrorSeverity, @ErrorState);");
+	sb.AppendLine("  RAISERROR(ERROR_MESSAGE(), ERROR_SEVERITY(), ERROR_STATE());");
 	sb.AppendLine(" END CATCH");
 	sb.AppendLine("END");
 	return sb.ToString();
 }
 
 // ─────────────────────────────────────────────
-// Read procedures – now with explicit column lists
+// Read procedures – explicit columns + composite PK
 // ─────────────────────────────────────────────
 static string GetByIdProc(string schema, string baseName, string table, List<Column> pk, Column? softDeleteCol, bool enableSoftDelete, string selectList)
 {
 	var proc = $"[{schema}].[{baseName}_GetById]";
 	var parms = pk.Select(ParamDecl).ToList();
-	var where = string.Join(" AND ", pk.Select(c => $"[{c.Name}] = @{c.Name}"));
+	var where = string.Join(" AND ", pk.Select(c => $"t.[{c.Name}] = @{c.Name}"));
 
 	var sb = new StringBuilder();
 	sb.AppendLine($"CREATE OR ALTER PROCEDURE {proc}");
