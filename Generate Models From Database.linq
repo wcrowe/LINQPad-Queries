@@ -25,6 +25,14 @@
 // LINQPad 9 - Generates C# record POCOs with DataAnnotations from database tables
 // Outputs to Results and optionally to disk
 
+//TODO: Option Fluent API configuration(EF Core)
+//TODO: Option Separate file per class
+
+//TODO:  Option to add JSON attributes([JsonPropertyName])
+//TODO: Last explore adding Inheritance/ base class
+
+
+
 using System;
 using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
