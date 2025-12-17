@@ -22,12 +22,24 @@
 </Query>
 
 #nullable enable
-// LINQPad 9 - Generates C# record POCOs with DataAnnotations from database tables
-// Outputs to Results and optionally to disk
+/*
+You are an expert C# and SQL Server developer. Your task is to maintain a LINQPad script that generates calls to existing stored procedures. Will be using Dapper.
+
+
+This script:
+- Outputs everything to LINQPad results with the option to save to the path C:\dev\GeneratedModels
+
+Rules you MUST follow:
+- NEVER break existing functionality. The script must still generate the same correct source as before.
+- Output only the full updated script — nothing else.
+- Do not change options or exclusions unless explicitly asked.
+- Test logic for composite
+--Use Best Practices for NET 10 and LINQPad 9
+
+*/
 
 //TODO: Option Fluent API configuration(EF Core)
 //TODO: Option Separate file per class
-
 //TODO:  Option to add JSON attributes([JsonPropertyName])
 //TODO: Last explore adding Inheritance/ base class
 
