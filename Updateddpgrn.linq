@@ -8,13 +8,14 @@ using System.IO;
 
 // ─────────────────────────────────────────────
 // LINQPad 9: Universal Stored Procedure Generator
+// Updated: Using THROW in CATCH blocks (modern best practice)
 // Features:
-// - Separate UPDATE + INSERT for Upsert (better performance than MERGE)
-// - Full transaction + TRY/CATCH with proper line breaks (fixed syntax error)
-// - Audit columns (Created*/Updated*) auto-filled with SYSUTCDATETIME()
-// - Soft delete support (IsDeleted/IsActive bit column)
-// - Pagination for ListAll/Search (OFFSET/FETCH)
-// - Row versioning (ConcurrencyStamp or RowVersion/timestamp column)
+// - Separate UPDATE + INSERT for Upsert
+// - Audit columns (Created*/Updated*)
+// - Soft delete + Restore
+// - Pagination
+// - Versioning
+// - Proper line breaks in CATCH (fixed syntax errors)
 // ─────────────────────────────────────────────
 void Main()
 {
@@ -53,6 +54,7 @@ void Main()
     master.AppendLine("-- =================================================");
     master.AppendLine("-- Auto-Generated CRUD Stored Procedures");
     master.AppendLine("-- Features: Upsert, Audit, Soft Delete (+Restore), Pagination, Versioning");
+    master.AppendLine("-- Error handling: THROW (modern best practice)");
     master.AppendLine($"-- Database: {conn.Database}");
     master.AppendLine($"-- Generated: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
     master.AppendLine("-- =================================================");
@@ -181,7 +183,7 @@ static List<Column> LoadColumns(SqlConnection conn, string schema, string table)
             r.GetBoolean(5),
             r.GetBoolean(6),
             r.GetBoolean(7),
-            r.GetInt32(8) == 1  // Fixed: explicit conversion to bool
+            r.GetInt32(8) == 1
         ));
     }
     return list;
@@ -303,7 +305,23 @@ static string GenerateProcedures(GeneratorOptions opts, string tableSchema, stri
 }
 
 // ─────────────────────────────────────────────
-// Insert (with audit, soft delete, versioning init)
+// Common CATCH Block (now using THROW)
+// ─────────────────────────────────────────────
+static void AppendCatchBlock(StringBuilder sb, bool hasTransaction = false)
+{
+    sb.AppendLine(" BEGIN CATCH");
+    if (hasTransaction)
+    {
+        sb.AppendLine("  IF @@TRANCOUNT > 0");
+        sb.AppendLine("   ROLLBACK TRANSACTION;");
+        sb.AppendLine();
+    }
+    sb.AppendLine("  THROW;");
+    sb.AppendLine(" END CATCH");
+}
+
+// ─────────────────────────────────────────────
+// Insert
 // ─────────────────────────────────────────────
 static string InsertProc(string schema, string baseName, string table, List<Column> cols, List<Column> pk, Column? identity, Column? created, Column? updated, Column? softDelete, Column? version)
 {
@@ -356,21 +374,13 @@ static string InsertProc(string schema, string baseName, string table, List<Colu
     }
 
     sb.AppendLine(" END TRY");
-    sb.AppendLine(" BEGIN CATCH");
-    sb.AppendLine("  IF @@TRANCOUNT > 0");
-    sb.AppendLine("   ROLLBACK TRANSACTION;");
-    sb.AppendLine();
-    sb.AppendLine("  DECLARE @ErrorMessage nvarchar(4000) = ERROR_MESSAGE();");
-    sb.AppendLine("  DECLARE @ErrorSeverity int = ERROR_SEVERITY();");
-    sb.AppendLine("  DECLARE @ErrorState int = ERROR_STATE();");
-    sb.AppendLine("  RAISERROR(@ErrorMessage, @ErrorSeverity, @ErrorState);");
-    sb.AppendLine(" END CATCH");
+    AppendCatchBlock(sb);
     sb.AppendLine("END");
     return sb.ToString();
 }
 
 // ─────────────────────────────────────────────
-// Update (with audit + versioning check)
+// Update
 // ─────────────────────────────────────────────
 static string UpdateProc(string schema, string baseName, string table, List<Column> pk, List<Column> cols, Column? updated, Column? version)
 {
@@ -414,21 +424,13 @@ static string UpdateProc(string schema, string baseName, string table, List<Colu
     }
 
     sb.AppendLine(" END TRY");
-    sb.AppendLine(" BEGIN CATCH");
-    sb.AppendLine("  IF @@TRANCOUNT > 0");
-    sb.AppendLine("   ROLLBACK TRANSACTION;");
-    sb.AppendLine();
-    sb.AppendLine("  DECLARE @ErrorMessage nvarchar(4000) = ERROR_MESSAGE();");
-    sb.AppendLine("  DECLARE @ErrorSeverity int = ERROR_SEVERITY();");
-    sb.AppendLine("  DECLARE @ErrorState int = ERROR_STATE();");
-    sb.AppendLine("  RAISERROR(@ErrorMessage, @ErrorSeverity, @ErrorState);");
-    sb.AppendLine(" END CATCH");
+    AppendCatchBlock(sb);
     sb.AppendLine("END");
     return sb.ToString();
 }
 
 // ─────────────────────────────────────────────
-// Upsert (with audit, soft delete, versioning)
+// Upsert
 // ─────────────────────────────────────────────
 static string UpsertProc(string schema, string baseName, string table, List<Column> insertable, List<Column> updatable, List<Column> columns, List<Column> pk, Column? identity, Column? created, Column? updated, Column? softDelete, Column? version)
 {
@@ -522,21 +524,13 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
     sb.AppendLine("  SELECT 1 AS RowsAffected;");
 
     sb.AppendLine(" END TRY");
-    sb.AppendLine(" BEGIN CATCH");
-    sb.AppendLine("  IF @@TRANCOUNT > 0");
-    sb.AppendLine("   ROLLBACK TRANSACTION;");
-    sb.AppendLine();
-    sb.AppendLine("  DECLARE @ErrorMessage nvarchar(4000) = ERROR_MESSAGE();");
-    sb.AppendLine("  DECLARE @ErrorSeverity int = ERROR_SEVERITY();");
-    sb.AppendLine("  DECLARE @ErrorState int = ERROR_STATE();");
-    sb.AppendLine("  RAISERROR(@ErrorMessage, @ErrorSeverity, @ErrorState);");
-    sb.AppendLine(" END CATCH");
+    AppendCatchBlock(sb, hasTransaction: true);
     sb.AppendLine("END");
     return sb.ToString();
 }
 
 // ─────────────────────────────────────────────
-// Delete (soft or hard)
+// Delete / Soft Delete
 // ─────────────────────────────────────────────
 static string DeleteProc(string schema, string baseName, string table, List<Column> pk, Column? softDeleteCol, bool enableSoftDelete)
 {
@@ -564,15 +558,7 @@ static string DeleteProc(string schema, string baseName, string table, List<Colu
 
     sb.AppendLine("  SELECT @@ROWCOUNT AS RowsAffected;");
     sb.AppendLine(" END TRY");
-    sb.AppendLine(" BEGIN CATCH");
-    sb.AppendLine("  IF @@TRANCOUNT > 0");
-    sb.AppendLine("   ROLLBACK TRANSACTION;");
-    sb.AppendLine();
-    sb.AppendLine("  DECLARE @ErrorMessage nvarchar(4000) = ERROR_MESSAGE();");
-    sb.AppendLine("  DECLARE @ErrorSeverity int = ERROR_SEVERITY();");
-    sb.AppendLine("  DECLARE @ErrorState int = ERROR_STATE();");
-    sb.AppendLine("  RAISERROR(@ErrorMessage, @ErrorSeverity, @ErrorState);");
-    sb.AppendLine(" END CATCH");
+    AppendCatchBlock(sb);
     sb.AppendLine("END");
     return sb.ToString();
 }
@@ -596,21 +582,13 @@ static string RestoreProc(string schema, string baseName, string table, List<Col
 
     sb.AppendLine("  SELECT @@ROWCOUNT AS RowsAffected;");
     sb.AppendLine(" END TRY");
-    sb.AppendLine(" BEGIN CATCH");
-    sb.AppendLine("  IF @@TRANCOUNT > 0");
-    sb.AppendLine("   ROLLBACK TRANSACTION;");
-    sb.AppendLine();
-    sb.AppendLine("  DECLARE @ErrorMessage nvarchar(4000) = ERROR_MESSAGE();");
-    sb.AppendLine("  DECLARE @ErrorSeverity int = ERROR_SEVERITY();");
-    sb.AppendLine("  DECLARE @ErrorState int = ERROR_STATE();");
-    sb.AppendLine("  RAISERROR(@ErrorMessage, @ErrorSeverity, @ErrorState);");
-    sb.AppendLine(" END CATCH");
+    AppendCatchBlock(sb);
     sb.AppendLine("END");
     return sb.ToString();
 }
 
 // ─────────────────────────────────────────────
-// Read procedures (filter soft-deleted)
+// Read procedures
 // ─────────────────────────────────────────────
 static string GetByIdProc(string schema, string baseName, string table, List<Column> pk, Column? softDeleteCol, bool enableSoftDelete)
 {
