@@ -28,14 +28,14 @@ using System.IO;
 
 // ─────────────────────────────────────────────
 // LINQPad 9: Universal Stored Procedure Generator
-// Updated: Using THROW in CATCH blocks (modern best practice)
 // Features:
-// - Separate UPDATE + INSERT for Upsert
-// - Audit columns (Created*/Updated*)
+// - Upsert (UPDATE+INSERT)
+// - Audit columns (Created/Updated)
 // - Soft delete + Restore
 // - Pagination
-// - Versioning
-// - Proper line breaks in CATCH (fixed syntax errors)
+// - Smart versioning (built-in timestamp/rowversion first, manual ConcurrencyStamp second)
+// - Modern THROW error handling
+// - Ignores temporal table columns (ValidFrom/ValidTo, SysStartTime/SysEndTime)
 // ─────────────────────────────────────────────
 void Main()
 {
@@ -73,8 +73,7 @@ void Main()
 	var master = new StringBuilder();
 	master.AppendLine("-- =================================================");
 	master.AppendLine("-- Auto-Generated CRUD Stored Procedures");
-	master.AppendLine("-- Features: Upsert, Audit, Soft Delete (+Restore), Pagination, Versioning");
-	master.AppendLine("-- Error handling: THROW (modern best practice)");
+	master.AppendLine("-- Features: Upsert, Audit, Soft Delete (+Restore), Pagination, Smart Versioning");
 	master.AppendLine($"-- Database: {conn.Database}");
 	master.AppendLine($"-- Generated: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
 	master.AppendLine("-- =================================================");
@@ -231,9 +230,9 @@ static List<string> LoadPrimaryKey(SqlConnection conn, string schema, string tab
 }
 
 // ─────────────────────────────────────────────
-// Special Column Detection
+// Smart Versioning Detection
 // ─────────────────────────────────────────────
-static (Column? Created, Column? Updated, Column? SoftDelete, Column? Version) DetectSpecialColumns(List<Column> columns)
+static (Column? Created, Column? Updated, Column? SoftDelete, Column? BuiltInVersion, Column? ManualVersion) DetectSpecialColumns(List<Column> columns)
 {
 	var createdPatterns = new[] { "Created", "CreatedOn", "CreatedAt", "DateCreated" };
 	var updatedPatterns = new[] { "Updated", "UpdatedOn", "UpdatedAt", "DateUpdated", "LastModified" };
@@ -252,11 +251,15 @@ static (Column? Created, Column? Updated, Column? SoftDelete, Column? Version) D
 		softDeletePatterns.Any(p => c.Name.Contains(p, StringComparison.OrdinalIgnoreCase)) &&
 		c.TypeName == "bit");
 
-	var version = columns.FirstOrDefault(c =>
-		versionPatterns.Any(p => c.Name.Contains(p, StringComparison.OrdinalIgnoreCase)) &&
-		(c.TypeName == "timestamp" || c.IsRowVersion || c.TypeName.Contains("stamp", StringComparison.OrdinalIgnoreCase)));
+	var builtInVersion = columns.FirstOrDefault(c => c.TypeName == "timestamp" || c.IsRowVersion);
 
-	return (created, updated, softDelete, version);
+	var manualVersion = builtInVersion == null
+		? columns.FirstOrDefault(c =>
+			versionPatterns.Any(p => c.Name.Contains(p, StringComparison.OrdinalIgnoreCase)) &&
+			(c.TypeName == "uniqueidentifier" || c.TypeName == "int" || c.TypeName == "bigint"))
+		: null;
+
+	return (created, updated, softDelete, builtInVersion, manualVersion);
 }
 
 // ─────────────────────────────────────────────
@@ -272,12 +275,16 @@ static string GenerateProcedures(GeneratorOptions opts, string tableSchema, stri
 	var identity = columns.FirstOrDefault(c => c.IsIdentity);
 	var isIdentityPk = identity != null && pkNames.Count == 1 && pkNames[0] == identity.Name;
 
+	// First unpack so manualVersion is available for lambdas
+	var (createdCol, updatedCol, softDeleteCol, builtInVersion, manualVersion) = DetectSpecialColumns(columns);
+	var versionCol = builtInVersion ?? manualVersion;
+
 	var insertable = columns.Where(c =>
 		!c.IsIdentity &&
 		!c.IsComputed &&
 		!(opts.EnableAuditTrail && (c.Name.Contains("Created", StringComparison.OrdinalIgnoreCase) || c.Name.Contains("Updated", StringComparison.OrdinalIgnoreCase))) &&
 		!(opts.EnableSoftDelete && (c.Name.Contains("IsDeleted", StringComparison.OrdinalIgnoreCase) || c.Name.Contains("IsActive", StringComparison.OrdinalIgnoreCase))) &&
-		!(opts.EnableVersioning && c.IsRowVersion))
+		!(opts.EnableVersioning && (c.IsRowVersion || c == manualVersion)))
 		.ToList();
 
 	var updatable = columns.Where(c =>
@@ -286,15 +293,13 @@ static string GenerateProcedures(GeneratorOptions opts, string tableSchema, stri
 		!c.IsComputed &&
 		!(opts.EnableAuditTrail && (c.Name.Contains("Created", StringComparison.OrdinalIgnoreCase) || c.Name.Contains("Updated", StringComparison.OrdinalIgnoreCase))) &&
 		!(opts.EnableSoftDelete && (c.Name.Contains("IsDeleted", StringComparison.OrdinalIgnoreCase) || c.Name.Contains("IsActive", StringComparison.OrdinalIgnoreCase))) &&
-		!(opts.EnableVersioning && c.IsRowVersion))
+		!(opts.EnableVersioning && (c.IsRowVersion || c == manualVersion)))
 		.ToList();
-
-	var (createdCol, updatedCol, softDeleteCol, versionCol) = DetectSpecialColumns(columns);
 
 	var sb = new StringBuilder();
 	sb.AppendLine($"-- CRUD Procedures for {table}");
 	if (createdCol != null || updatedCol != null || softDeleteCol != null || versionCol != null)
-		sb.AppendLine($"-- Special: {(createdCol != null ? "Created" : "")} {(updatedCol != null ? "Updated" : "")} {(softDeleteCol != null ? "SoftDelete" : "")} {(versionCol != null ? "Versioning" : "")}".Trim());
+		sb.AppendLine($"-- Special: {(createdCol != null ? "Created" : "")} {(updatedCol != null ? "Updated" : "")} {(softDeleteCol != null ? "SoftDelete" : "")} {(versionCol != null ? (builtInVersion != null ? "Built-in Versioning" : "Manual Versioning") : "")}".Trim());
 	sb.AppendLine();
 
 	void AddProc(string name, Action generator)
@@ -322,22 +327,6 @@ static string GenerateProcedures(GeneratorOptions opts, string tableSchema, stri
 		AddProc($"{baseName}_Search", () => sb.Append(SearchProc(procSchema, baseName, table, columns, softDeleteCol, opts.EnableSoftDelete)));
 
 	return sb.ToString();
-}
-
-// ─────────────────────────────────────────────
-// Common CATCH Block (now using THROW)
-// ─────────────────────────────────────────────
-static void AppendCatchBlock(StringBuilder sb, bool hasTransaction = false)
-{
-	sb.AppendLine(" BEGIN CATCH");
-	if (hasTransaction)
-	{
-		sb.AppendLine("  IF @@TRANCOUNT > 0");
-		sb.AppendLine("   ROLLBACK TRANSACTION;");
-		sb.AppendLine();
-	}
-	sb.AppendLine("  THROW;");
-	sb.AppendLine(" END CATCH");
 }
 
 // ─────────────────────────────────────────────
@@ -494,7 +483,6 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 	if (version != null)
 		pkWhere += $" AND t.[{version.Name}] = @{version.Name}";
 
-	// UPDATE
 	var updateSets = nonPkDataColumns.Select(c => $"[{c.Name}] = @{c.Name}").ToList();
 	if (updated != null)
 		updateSets.Add($"[{updated.Name}] = SYSUTCDATETIME()");
@@ -510,7 +498,6 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 		sb.AppendLine();
 	}
 
-	// INSERT
 	sb.AppendLine($"  IF @@ROWCOUNT = 0");
 	sb.AppendLine("  BEGIN");
 
@@ -550,7 +537,7 @@ static string UpsertProc(string schema, string baseName, string table, List<Colu
 }
 
 // ─────────────────────────────────────────────
-// Delete / Soft Delete
+// Delete / Restore
 // ─────────────────────────────────────────────
 static string DeleteProc(string schema, string baseName, string table, List<Column> pk, Column? softDeleteCol, bool enableSoftDelete)
 {
@@ -701,4 +688,20 @@ static string SqlType(Column c)
 		"datetime2" or "datetimeoffset" or "time" => $"{c.TypeName}({c.Scale})",
 		_ => c.TypeName
 	};
+}
+
+// ─────────────────────────────────────────────
+// Centralized CATCH Block (using THROW)
+// ─────────────────────────────────────────────
+static void AppendCatchBlock(StringBuilder sb, bool hasTransaction = false)
+{
+	sb.AppendLine(" BEGIN CATCH");
+	if (hasTransaction)
+	{
+		sb.AppendLine("  IF @@TRANCOUNT > 0");
+		sb.AppendLine("   ROLLBACK TRANSACTION;");
+		sb.AppendLine();
+	}
+	sb.AppendLine("  THROW;");
+	sb.AppendLine(" END CATCH");
 }
